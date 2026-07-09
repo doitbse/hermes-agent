@@ -4855,7 +4855,67 @@ def _build_bedrock_client(provider: str, model: Optional[str], *, raw_codex: boo
 
 
 def _build_vertex_client(provider: str, model: Optional[str]) -> tuple[Optional[Any], Optional[str]]:
-    """Google Vertex AI: Gemini via the OpenAI-compatible endpoint with an OAuth2 bearer (standard OpenAI client)."""
+    """Google Vertex AI: Claude → AnthropicVertex SDK (Anthropic Messages); Gemini → the
+    OpenAI-compatible endpoint with an OAuth2 bearer (standard OpenAI client)."""
+    # Vertex Model Garden hosts multiple publisher families through one
+    # provider name: Google's Gemini via the OpenAI-compat aggregator,
+    # Anthropic's Claude via native Messages at ``publishers/anthropic/
+    # models/*:rawPredict``. Wire protocol is chosen by model prefix.
+    # Mirrors ``hermes_cli/runtime_provider.py``'s main-agent dispatch
+    # so auxiliary tasks (vision, compression, curator, session_search)
+    # route the same way as the top-level turn.
+    try:
+        from agent.anthropic_vertex_adapter import is_anthropic_vertex_model
+    except ImportError:
+        def is_anthropic_vertex_model(_m: str) -> bool:
+            return False
+
+    if model and is_anthropic_vertex_model(model):
+        # Claude on Vertex → AnthropicVertex SDK (Anthropic Messages wire).
+        # Same shape as _build_bedrock_client's Anthropic path — build a real
+        # Anthropic client, wrap it in the OpenAI-compatible shim.
+        try:
+            from agent.anthropic_vertex_adapter import (
+                build_anthropic_vertex_base_url,
+                build_anthropic_vertex_client,
+                get_anthropic_vertex_config,
+                has_anthropic_vertex_credentials,
+            )
+        except ImportError:
+            logger.warning("resolve_provider_client: vertex-anthropic "
+                           "requested but the anthropic SDK / google-auth "
+                           "is not installed")
+            return None, None
+
+        if not has_anthropic_vertex_credentials():
+            logger.debug("resolve_provider_client: vertex-anthropic "
+                         "requested but no GCP credentials found")
+            return None, None
+
+        project_id, region = get_anthropic_vertex_config()
+        if not project_id:
+            logger.warning("resolve_provider_client: vertex-anthropic "
+                           "requested but project_id resolution failed")
+            return None, None
+
+        final_model = _normalize_resolved_model(model, provider)
+        try:
+            real_client = build_anthropic_vertex_client(project_id, region)
+        except (ImportError, RuntimeError) as exc:
+            logger.warning("resolve_provider_client: cannot create "
+                           "AnthropicVertex client: %s", exc)
+            return None, None
+
+        client = AnthropicAuxiliaryClient(
+            real_client, final_model, api_key="vertex-adc",
+            base_url=build_anthropic_vertex_base_url(project_id, region),
+        )
+        logger.debug("resolve_provider_client: vertex anthropic (%s, %s/%s)",
+                     final_model, project_id, region)
+        return client, final_model
+
+    # Gemini on Vertex (default when no explicit model, or a ``google/...``
+    # slug) — OpenAI-compat aggregator with an OAuth2 bearer, not a static key.
     try:
         from agent.vertex_adapter import get_vertex_config, has_vertex_credentials
     except ImportError:
@@ -4876,7 +4936,7 @@ def _build_vertex_client(provider: str, model: Optional[str]) -> tuple[Optional[
     except Exception as exc:
         logger.warning("resolve_provider_client: cannot create Vertex client: %s", exc)
         return None, None
-    logger.debug("resolve_provider_client: vertex (%s)", final_model)
+    logger.debug("resolve_provider_client: vertex gemini (%s)", final_model)
     return client, final_model
 
 
@@ -5392,9 +5452,47 @@ def _resolve_registry_branch(req: _ResolveRequest) -> _ResolveResult:
         return None, None
     pconfig = PROVIDER_REGISTRY.get(provider)
     if pconfig is None:
-        _log_once_debug(_LOGGED_UNKNOWN_PROVIDER_KEYS, provider,
-                        "resolve_provider_client: unknown provider %r", provider)
-        return None, None
+        # Plugin-catalog fallback for non-api_key providers.
+        #
+        # ``hermes_cli/auth.py`` auto-extends ``PROVIDER_REGISTRY`` from the
+        # provider-plugin catalog, but its filter (``auth_type != "api_key"
+        # or not env_vars``) intentionally skips OAuth-token / SDK-token
+        # providers (vertex, aws_sdk, oauth_device_code, oauth_external).
+        # Without this fallback, ``resolve_provider_client("vertex", ...)``
+        # returns ``(None, None)`` and the ``auth_type == "vertex"`` branch
+        # below is dead code — silently breaking every auxiliary task
+        # (vision, compression, curator, session_search, title generation)
+        # on any deployment whose main provider is a non-api_key one.
+        #
+        # Consult the plugin catalog directly for the well-known non-api_key
+        # auth families and synthesize a minimal ``pconfig``-shaped object
+        # so the existing auth_type dispatch further down still fires. The
+        # dispatch is the single source of truth for how each family builds
+        # a client; we only fix the reachability.
+        try:
+            from providers import get_provider_profile as _get_provider_profile
+        except ImportError:
+            _get_provider_profile = None
+
+        _plugin_profile = None
+        if _get_provider_profile is not None:
+            try:
+                _plugin_profile = _get_provider_profile(provider)
+            except Exception:
+                _plugin_profile = None
+
+        _NON_API_KEY_AUTH_TYPES = {
+            "vertex", "aws_sdk", "oauth_device_code", "oauth_external",
+        }
+        if (
+            _plugin_profile is not None
+            and _plugin_profile.auth_type in _NON_API_KEY_AUTH_TYPES
+        ):
+            pconfig = SimpleNamespace(auth_type=_plugin_profile.auth_type)
+        else:
+            _log_once_debug(_LOGGED_UNKNOWN_PROVIDER_KEYS, provider,
+                            "resolve_provider_client: unknown provider %r", provider)
+            return None, None
     auth_type = pconfig.auth_type
     if auth_type == "api_key":
         return _resolve_api_key_branch(req, pconfig, resolve_api_key_provider_credentials)
