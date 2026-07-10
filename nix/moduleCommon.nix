@@ -69,11 +69,24 @@ let
 
       # Authentication
       auth = mkOption {
-        type = types.nullOr (types.enum [ "oauth" ]);
+        type = types.nullOr (
+          types.enum [
+            "oauth"
+            "header"
+          ]
+        );
         default = null;
         description = ''
-          Authentication method. Set to "oauth" for OAuth 2.1 PKCE flow
-          (remote MCP servers). Tokens are stored in $HERMES_HOME/mcp-tokens/.
+          Authentication method for remote (HTTP) MCP servers.
+
+          - "oauth"  — OAuth 2.1 PKCE flow. Tokens are stored in
+                       $HERMES_HOME/mcp-tokens/ and refreshed on demand.
+          - "header" — static bearer / API-key authentication. The
+                       actual credential lives in the `headers`
+                       attrset (typically as a `''${VAR}` placeholder
+                       interpolated from $HERMES_HOME/.env at
+                       MCP-client startup).
+          - null     — no authentication (public server).
         '';
       };
 
@@ -404,6 +417,11 @@ let
             remote-oauth = {
               url = "https://mcp.example.com/mcp";
               auth = "oauth";
+            };
+            remote-header = {
+              url = "https://mcp.vendor.com/mcp";
+              auth = "header";
+              headers."API-KEY" = "\''${VENDOR_API_KEY}";
             };
           }
         '';
