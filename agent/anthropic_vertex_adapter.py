@@ -42,6 +42,7 @@ from agent.vertex_adapter import (
     _resolve_project_override,
     _resolve_region,
     google,
+    has_adc_available,
 )
 
 logger = logging.getLogger(__name__)
@@ -251,15 +252,24 @@ def has_anthropic_vertex_credentials() -> bool:
     """Fast check for whether Anthropic-on-Vertex credentials are configured.
 
     No network calls, no SDK import — safe for provider auto-detection
-    and setup-status display. True when either a service-account JSON
-    path is resolvable, or an explicit project ID is configured (env or
-    config.yaml, implying ADC is intended).
+    and setup-status display. True when a service-account JSON path is
+    resolvable, an explicit project ID is configured (env or config.yaml,
+    implying ADC is intended), or ADC itself is plausibly available.
+
+    Kept deliberately identical to :func:`vertex_adapter.has_vertex_credentials`.
+    The two are separate gates on the same credential — this one guards the
+    Claude-on-Vertex path in ``hermes_cli.runtime_provider`` and the
+    ``anthropic/``-prefixed branch of the auxiliary client, the other guards
+    the Gemini/aggregator path — so a signal accepted by one and rejected by
+    the other produces a half-working deployment: an instance whose main
+    conversation path is dead while auxiliary tasks run, or the reverse. If
+    you change the accepted signals here, change them there too.
     """
     if _resolve_credentials_path(None):
         return True
     if _resolve_project_override():
         return True
-    return False
+    return has_adc_available()
 
 
 def is_anthropic_vertex_model(model_id: str) -> bool:
