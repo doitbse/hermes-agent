@@ -300,10 +300,74 @@ class TestHasAnthropicVertexCredentials:
                 "agent.anthropic_vertex_adapter._resolve_project_override",
                 return_value=None,
             ),
+            # ADC must be stubbed absent, or this asserts nothing on a GCE
+            # host / any machine with `gcloud auth application-default login`.
+            patch(
+                "agent.anthropic_vertex_adapter.has_adc_available",
+                return_value=False,
+            ),
         ):
             from agent.anthropic_vertex_adapter import has_anthropic_vertex_credentials
 
             assert has_anthropic_vertex_credentials() is False
+
+    def test_adc_alone_is_sufficient(self):
+        """No SA file, no project override, ADC present -> True.
+
+        This is the GCE/GKE shape, and the regression this test exists for:
+        `has_vertex_credentials` and `has_anthropic_vertex_credentials` are two
+        separate gates on the same credential. Teaching only the first about ADC
+        left the Claude-on-Vertex path — the MAIN conversation path — refusing to
+        resolve a client on a host where the aggregator path worked fine.
+        """
+        with (
+            patch(
+                "agent.anthropic_vertex_adapter._resolve_credentials_path",
+                return_value=None,
+            ),
+            patch(
+                "agent.anthropic_vertex_adapter._resolve_project_override",
+                return_value=None,
+            ),
+            patch(
+                "agent.anthropic_vertex_adapter.has_adc_available",
+                return_value=True,
+            ),
+        ):
+            from agent.anthropic_vertex_adapter import has_anthropic_vertex_credentials
+
+            assert has_anthropic_vertex_credentials() is True
+
+    def test_both_vertex_gates_accept_the_same_signals(self):
+        """The two gates must agree, for every combination of signals.
+
+        They guard different wires onto one credential — the Anthropic Messages
+        path and the Gemini aggregator path — so any divergence yields a
+        half-working deployment rather than a clean failure. Asserted as a
+        contract over the inputs instead of duplicating each branch, so a new
+        signal added to one and not the other fails here.
+        """
+        from agent import anthropic_vertex_adapter as av
+        from agent import vertex_adapter as va
+
+        for sa_path, project, adc in [
+            (None, None, False),
+            (None, None, True),
+            (None, "proj", False),
+            ("/tmp/sa.json", None, False),
+        ]:
+            with (
+                patch.object(va, "_resolve_credentials_path", return_value=sa_path),
+                patch.object(va, "_resolve_project_override", return_value=project),
+                patch.object(va, "has_adc_available", return_value=adc),
+                patch.object(av, "_resolve_credentials_path", return_value=sa_path),
+                patch.object(av, "_resolve_project_override", return_value=project),
+                patch.object(av, "has_adc_available", return_value=adc),
+            ):
+                assert (
+                    av.has_anthropic_vertex_credentials()
+                    == va.has_vertex_credentials()
+                ), f"gates disagree for sa={sa_path} project={project} adc={adc}"
 
 
 # ---------------------------------------------------------------------------
