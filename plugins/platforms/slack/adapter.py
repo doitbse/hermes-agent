@@ -6415,7 +6415,8 @@ class SlackAdapter(BasePlatformAdapter):
         self_uids = {u for u in (bot_uid, self._bot_user_id) if u}
         if addressed or self._slack_message_mentions_self(routing_text, self_uids):
             return True
-        if self._slack_message_addressed_to_other_user(routing_text, self_uids):
+        if (self._slack_message_addressed_to_other_user(routing_text, self_uids)
+                or self._slack_message_mentions_only_other_users(routing_text, self_uids)):
             return False
         return False if opens_own_session and self._slack_is_free_channel(channel_id) else None
 
@@ -6424,6 +6425,14 @@ class SlackAdapter(BasePlatformAdapter):
         ``<@U123|name>`` form (``is_mentioned`` only recognises the former)."""
         return bool(text) and any(
             re.search(rf"<@{re.escape(uid)}(?:\|[^>]*)?>", text) for uid in self_uids)
+
+    def _slack_message_mentions_only_other_users(self, text: str, self_uids: set) -> bool:
+        """True when ``text`` has at least one user mention (``<@U123>``/``<@U123|name>``,
+        anywhere, e.g. a trailing ``CC <@U123>``) and none of them is this bot; ``<!here>``,
+        ``<!channel>`` and ``<#C…>`` are not user mentions. Lets a courtesy CC of a third party
+        in a thread the bot is part of carry ``reply_expected=False`` so a silence marker stands."""
+        uids = re.findall(r"<@([^>|\s]+)(?:\|[^>]*)?>", text or "")
+        return bool(uids) and all(uid not in self_uids for uid in uids)
 
     def _extra_or_env_channel_set(
         self, key: str, env_var: str, *, coerce_scalar: bool = False) -> set:
