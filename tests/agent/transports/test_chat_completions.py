@@ -360,6 +360,31 @@ class TestChatCompletionsBuildKwargs:
             "thinking_level": "high",
         }
 
+    @pytest.mark.parametrize(
+        "effort,expected_level",
+        [
+            ("high", "high"),
+            ("xhigh", "high"),
+            ("max", "high"),
+            ("ultra", "high"),
+            ("medium", "medium"),
+            ("low", "low"),
+            ("minimal", "low"),
+        ],
+    )
+    def test_gemini_4_argon_maps_effort_to_thinking_level(self, transport, effort, expected_level):
+        """Argon accepts thinkingLevel low/medium/high only and 400s on thinkingBudget."""
+        kw = transport.build_kwargs(
+            model="google/gemini-4-argon",
+            messages=[{"role": "user", "content": "Hi"}],
+            provider_name="gemini",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+            reasoning_config={"enabled": True, "effort": effort},
+        )
+        thinking = kw["extra_body"]["extra_body"]["google"]["thinking_config"]
+        assert thinking == {"include_thoughts": True, "thinking_level": expected_level}
+        assert "thinking_budget" not in thinking
+
     def test_gemini_ultra_thinking_raises_first_request_max_tokens(self, transport):
         from agent.gemini_native_adapter import GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
         from providers import get_provider_profile

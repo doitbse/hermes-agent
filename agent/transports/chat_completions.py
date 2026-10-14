@@ -192,6 +192,13 @@ def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> 
         return thinking_config
     if effort not in {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
         effort = "medium"
+    # Gemini 4 accepts thinkingLevel low/medium/high only (no minimal) and 400s on thinkingBudget,
+    # so emit a level and never a budget; minimal/low -> low, _HIGH_EFFORTS -> high, else medium.
+    if normalized_model.startswith("gemini-4"):
+        thinking_config["thinkingLevel"] = (
+            "low" if effort in {"minimal", "low"} else "high" if effort in _HIGH_EFFORTS else "medium"
+        )
+        return thinking_config
     # Gemini 3 Flash documents low/medium/high thinking levels; Gemini 3 Pro
     # is stricter (low/high). Clamp Hermes' wider effort set to what each
     # family accepts so we never forward an undocumented level verbatim.
