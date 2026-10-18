@@ -157,7 +157,7 @@ class TestVertexAnthropicDispatch:
         p1, p2, p3 = self._patched_anthropic_success()
         with p1, p2, p3:
             client, model = resolve_provider_client(
-                "vertex", "anthropic/claude-opus-4-8", is_vision=True,
+                "vertex", "anthropic/claude-opus-5-5", is_vision=True,
             )
         assert isinstance(client, AnthropicAuxiliaryClient), (
             "Expected AnthropicAuxiliaryClient wrapping the AnthropicVertex "
@@ -166,16 +166,16 @@ class TestVertexAnthropicDispatch:
 
     def test_anthropic_model_prefix_stripped_in_stored_model(self):
         """The AnthropicVertex SDK expects the bare model id
-        (``claude-opus-4-8``). ``_normalize_resolved_model`` should strip
+        (``claude-opus-5-5``). ``_normalize_resolved_model`` should strip
         the ``anthropic/`` prefix before we hand it to the wrapper."""
         from agent.auxiliary_client import resolve_provider_client
 
         p1, p2, p3 = self._patched_anthropic_success()
         with p1, p2, p3:
             _, model = resolve_provider_client(
-                "vertex", "anthropic/claude-opus-4-8",
+                "vertex", "anthropic/claude-opus-5-5",
             )
-        assert model == "claude-opus-4-8"
+        assert model == "claude-opus-5-5"
 
     def test_anthropic_client_carries_vertex_placeholder_api_key(self):
         """``AnthropicAuxiliaryClient`` demands a non-empty ``api_key`` so
@@ -188,7 +188,7 @@ class TestVertexAnthropicDispatch:
         p1, p2, p3 = self._patched_anthropic_success()
         with p1, p2, p3:
             client, _ = resolve_provider_client(
-                "vertex", "anthropic/claude-opus-4-8",
+                "vertex", "anthropic/claude-opus-5-5",
             )
         assert client.api_key == "vertex-adc"
 
@@ -203,7 +203,7 @@ class TestVertexAnthropicDispatch:
         p1, p2, p3 = self._patched_anthropic_success()
         with p1, p2, p3:
             client, _ = resolve_provider_client(
-                "vertex", "anthropic/claude-opus-4-8",
+                "vertex", "anthropic/claude-opus-5-5",
             )
         assert "aiplatform.googleapis.com" in client.base_url
         assert "publishers/anthropic" in client.base_url
@@ -220,7 +220,7 @@ class TestVertexAnthropicDispatch:
             return_value=False,
         ):
             client, model = resolve_provider_client(
-                "vertex", "anthropic/claude-opus-4-8",
+                "vertex", "anthropic/claude-opus-5-5",
             )
         assert client is None
         assert model is None
@@ -241,7 +241,7 @@ class TestVertexAnthropicDispatch:
             ),
         ):
             client, model = resolve_provider_client(
-                "vertex", "anthropic/claude-opus-4-8",
+                "vertex", "anthropic/claude-opus-5-5",
             )
         assert client is None
         assert model is None
@@ -266,7 +266,7 @@ class TestVertexAnthropicDispatch:
             ),
         ):
             client, model = resolve_provider_client(
-                "vertex", "anthropic/claude-opus-4-8",
+                "vertex", "anthropic/claude-opus-5-5",
             )
         assert client is None
         assert model is None
@@ -282,7 +282,7 @@ class TestVertexAnthropicDispatch:
         p1, p2, p3 = self._patched_anthropic_success()
         with p1, p2, p3:
             client, _ = resolve_provider_client(
-                "vertex", "ANTHROPIC/claude-opus-4-8",
+                "vertex", "ANTHROPIC/claude-opus-5-5",
             )
         assert isinstance(client, AnthropicAuxiliaryClient)
 
@@ -290,7 +290,7 @@ class TestVertexAnthropicDispatch:
         """``agent_init.py::normalize_model_for_provider`` strips the
         ``anthropic/`` prefix from the runtime main model for
         provider=vertex. ``set_runtime_main`` then stores the BARE form
-        (``claude-opus-4-8``), and every auxiliary read via
+        (``claude-opus-5-5``), and every auxiliary read via
         ``_read_main_model()`` sees that bare form.
 
         The strict classifier ``is_anthropic_vertex_model`` intentionally
@@ -313,15 +313,15 @@ class TestVertexAnthropicDispatch:
         p1, p2, p3 = self._patched_anthropic_success()
         with p1, p2, p3:
             client, model = resolve_provider_client(
-                "vertex", "claude-opus-4-8", is_vision=True,
+                "vertex", "claude-opus-5-5", is_vision=True,
             )
         assert isinstance(client, AnthropicAuxiliaryClient), (
-            "Bare 'claude-opus-4-8' must dispatch to AnthropicVertex on "
+            "Bare 'claude-opus-5-5' must dispatch to AnthropicVertex on "
             "the auxiliary path — the runtime main model is stored bare "
             "after agent_init normalization, and any Claude-on-Vertex "
             "aux call reads that bare form."
         )
-        assert model == "claude-opus-4-8"
+        assert model == "claude-opus-5-5"
 
     def test_bare_claude_case_insensitive(self):
         """Uppercase / mixed-case bare Claude slug also dispatches."""
@@ -333,7 +333,7 @@ class TestVertexAnthropicDispatch:
         p1, p2, p3 = self._patched_anthropic_success()
         with p1, p2, p3:
             client, _ = resolve_provider_client(
-                "vertex", "Claude-Opus-4-8",
+                "vertex", "Claude-Opus-5-5",
             )
         assert isinstance(client, AnthropicAuxiliaryClient)
 
@@ -349,7 +349,7 @@ class TestVertexAnthropicDispatch:
         p1, p2, p3 = self._patched_anthropic_success()
         with p1, p2, p3:
             client, _ = resolve_provider_client(
-                "vertex", "anthropic/claude-opus-4-8", async_mode=True,
+                "vertex", "anthropic/claude-opus-5-5", async_mode=True,
             )
         assert isinstance(client, AsyncAnthropicAuxiliaryClient)
 
