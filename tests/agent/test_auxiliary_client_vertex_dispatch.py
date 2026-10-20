@@ -359,28 +359,30 @@ class TestVertexAnthropicDispatch:
 # ---------------------------------------------------------------------------
 
 
-class TestVertexGeminiDispatch:
-    """Vertex + ``google/`` or empty model → OpenAI-compat aggregator."""
+_NATIVE_BASE = "https://aiplatform.googleapis.com/v1beta1/projects/p/locations/global/publishers/google"
 
-    def test_google_prefix_builds_openai_client(self):
-        """The pre-fix behaviour on the ``google/`` slug — protect it
-        against accidental regression when the Anthropic dispatch was
-        added on top."""
+
+class TestVertexGeminiDispatch:
+    """Vertex + ``google/`` / bare ``gemini-*`` / empty model → native generateContent (OAuth bearer)."""
+
+    def test_google_prefix_builds_native_gemini_client(self):
         from agent.auxiliary_client import resolve_provider_client
-        from openai import OpenAI
+        from agent.gemini_native_adapter import GeminiNativeClient
 
         with (
             patch("agent.vertex_adapter.has_vertex_credentials", return_value=True),
             patch("agent.vertex_adapter.get_vertex_config",
-                  return_value=("mocked-token", "https://aiplatform.googleapis.com/x")),
+                  return_value=("ya29.mocked-token", _NATIVE_BASE)),
         ):
             client, model = resolve_provider_client(
                 "vertex", "google/gemini-3.1-pro-preview",
             )
-        assert isinstance(client, OpenAI)
+        assert isinstance(client, GeminiNativeClient)
         assert model == "google/gemini-3.1-pro-preview"
-        assert client.api_key == "mocked-token"
-        assert "aiplatform.googleapis.com" in str(client.base_url)
+        assert client.base_url.endswith("/publishers/google")
+        headers = client._headers()
+        assert headers["Authorization"] == "Bearer ya29.mocked-token"
+        assert "x-goog-api-key" not in headers
 
     def test_no_model_falls_through_to_gemini_default(self):
         """No caller-supplied model → the default aux Gemini slug picks
@@ -388,36 +390,47 @@ class TestVertexGeminiDispatch:
         this to stand up a client on machines where ``auxiliary.vision``
         isn't configured."""
         from agent.auxiliary_client import resolve_provider_client
-        from openai import OpenAI
+        from agent.gemini_native_adapter import GeminiNativeClient
 
         with (
             patch("agent.vertex_adapter.has_vertex_credentials", return_value=True),
             patch("agent.vertex_adapter.get_vertex_config",
-                  return_value=("mocked-token", "https://aiplatform.googleapis.com/x")),
+                  return_value=("ya29.mocked-token", _NATIVE_BASE)),
         ):
             client, model = resolve_provider_client("vertex")
-        assert isinstance(client, OpenAI)
+        assert isinstance(client, GeminiNativeClient)
         assert model.startswith("google/")
 
-    def test_bare_gemini_slug_still_falls_to_gemini_aggregator(self):
-        """Bare ``gemini-*`` (no ``google/`` prefix) still resolves to
-        the OpenAI-compat aggregator — the Anthropic widening only
-        matches ``claude-*``. Vertex's Gemini endpoint requires the
-        ``google/`` prefix and will 404 the bare form, which is the
-        intended loud-fail behaviour for the Gemini path."""
+    def test_bare_gemini_slug_uses_native_client(self):
+        """Bare ``gemini-*`` stays on the Gemini path — the Anthropic
+        widening only matches ``claude-*``."""
+        from agent.auxiliary_client import resolve_provider_client
+        from agent.gemini_native_adapter import GeminiNativeClient
+
+        with (
+            patch("agent.vertex_adapter.has_vertex_credentials", return_value=True),
+            patch("agent.vertex_adapter.get_vertex_config",
+                  return_value=("ya29.mocked-token", _NATIVE_BASE)),
+        ):
+            client, model = resolve_provider_client(
+                "vertex", "gemini-3.1-pro-preview",
+            )
+        assert isinstance(client, GeminiNativeClient)
+        assert "claude" not in (model or "").lower()
+
+    def test_non_gemini_model_garden_slug_uses_openai_compat(self):
+        """``meta/…`` 404s on the Google publisher path → OpenAI-compat ``endpoints/openapi`` sibling."""
         from agent.auxiliary_client import resolve_provider_client
         from openai import OpenAI
 
         with (
             patch("agent.vertex_adapter.has_vertex_credentials", return_value=True),
             patch("agent.vertex_adapter.get_vertex_config",
-                  return_value=("mocked-token", "https://aiplatform.googleapis.com/x")),
+                  return_value=("ya29.mocked-token", _NATIVE_BASE)),
         ):
-            client, model = resolve_provider_client(
-                "vertex", "gemini-3.1-pro-preview",
-            )
+            client, _ = resolve_provider_client("vertex", "meta/llama-4-maverick")
         assert isinstance(client, OpenAI)
-        assert "claude" not in (model or "").lower()
+        assert str(client.base_url).rstrip("/").endswith("/endpoints/openapi")
 
     def test_missing_gcp_credentials_returns_none(self):
         from agent.auxiliary_client import resolve_provider_client
@@ -445,19 +458,19 @@ class TestVertexGeminiDispatch:
         assert client is None
         assert model is None
 
-    def test_async_mode_wraps_in_async_openai(self):
+    def test_async_mode_wraps_in_async_native_client(self):
         from agent.auxiliary_client import resolve_provider_client
-        from openai import AsyncOpenAI
+        from agent.gemini_native_adapter import AsyncGeminiNativeClient
 
         with (
             patch("agent.vertex_adapter.has_vertex_credentials", return_value=True),
             patch("agent.vertex_adapter.get_vertex_config",
-                  return_value=("mocked-token", "https://aiplatform.googleapis.com/x")),
+                  return_value=("ya29.mocked-token", _NATIVE_BASE)),
         ):
             client, _ = resolve_provider_client(
                 "vertex", "google/gemini-3.1-pro-preview", async_mode=True,
             )
-        assert isinstance(client, AsyncOpenAI)
+        assert isinstance(client, AsyncGeminiNativeClient)
 
 
 # ---------------------------------------------------------------------------

@@ -1011,15 +1011,16 @@ def _resolve_vertex_runtime(requested_provider: str, target_model: str = "") -> 
                         vertex_anthropic=True,  # Signal for client-construction sites
                         requested_provider=requested_provider)
 
-    # Gemini on Vertex → OpenAI-compat aggregator → chat_completions path
-    from agent.vertex_adapter import get_vertex_config
+    # Gemini on Vertex → native generateContent (GeminiNativeClient) under the chat_completions api_mode
+    from agent.vertex_adapter import get_vertex_config, vertex_base_url_for_model
     token, base_url = get_vertex_config()
     if not token or not base_url:
         raise AuthError("Vertex AI credentials could not be resolved. Vertex uses OAuth2 (not a static API key): provide a "
                         "service-account JSON via GOOGLE_APPLICATION_CREDENTIALS (or VERTEX_CREDENTIALS_PATH) in ~/.hermes/.env, "
                         "or run 'gcloud auth application-default login' for ADC. Set the GCP project/region under vertex: in "
                         "config.yaml if they aren't embedded in the credentials. Run `hermes setup` to install Vertex support.")
-    return _runtime("vertex", "chat_completions", base_url.rstrip("/"), token, source="vertex-oauth", requested_provider=requested_provider)
+    base_url = vertex_base_url_for_model(base_url, _model_default)
+    return _runtime("vertex", "chat_completions", base_url, token, source="vertex-oauth", requested_provider=requested_provider)
 
 
 def _resolve_requested_shortcuts(requested_provider, explicit_api_key, explicit_base_url, target_model) -> Optional[dict[str, Any]]:
