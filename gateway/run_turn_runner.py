@@ -487,6 +487,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             if api_execution.get() is not None:
                 # The API request's SSE observes reasoning/status/commentary through its admission.
                 wire_api_observers(agent, self._approval_owner, want_interim_messages)
+        from gateway.run_turn_thinking import arm_thinking_cards
+        # Module function, not ``self._arm_thinking_cards``: bare holders (tests, managed workers)
+        # lack the mixin; it never touches agent.reasoning_callback unless cards are armed.
+        arm_thinking_cards(self, agent, want_interim_messages)
         # A platform send can't be retracted; a local viewer withdraws the keyed notice.
         agent.notice_clear_callback = self._local_notice_clear_callback_sync if local_viewer_turn(self) else None
         agent.event_callback = ctx._event_callback_sync
