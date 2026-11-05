@@ -6,6 +6,7 @@ import logging
 import enum
 import os
 import threading
+import time
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 from tools.delegate_tool_registry import _active_subagents, _active_subagents_lock
@@ -291,6 +292,8 @@ class _ChildProgressRelay:
     rebuild the live spawn tree and route per-branch controls back by ``subagent_id``."""
 
     _BATCH_SIZE = 5
+    # Child reasoning streams per token; relay at most one cumulative preview per interval.
+    _REASONING_INTERVAL = 1.0
 
     def __init__(
         self, task_index: int, goal: str, spinner: Any, parent_cb: Any, task_count: int,
@@ -305,6 +308,8 @@ class _ChildProgressRelay:
         self.batch: list[str] = []
         self.parent_scope: Any = None  # owning parent agent; set by _build_child_progress_callback
         self.tool_count = 0  # per-subagent running counter
+        self._reasoning_lock = threading.Lock()
+        self._reasoning_buf, self._reasoning_sent, self._reasoning_at = "", 0, 0.0
 
     def _prefix(self) -> str:
         # The batch tag is resolved lazily from session_ref: the relay is built
@@ -346,6 +351,27 @@ class _ChildProgressRelay:
             self._relay("subagent.progress", preview=f"🔀 {self._prefix()}{', '.join(self.batch)}")
             self.batch.clear()
 
+    def on_reasoning(self, text: str) -> None:
+        """Child ``reasoning_callback``: coalesced ``subagent.thinking`` with the segment so far.
+        Parent-callback only; the CLI tree already prints the child's ``_thinking`` lines."""
+        if not text or not self.parent_cb:
+            return
+        with self._reasoning_lock:
+            self._reasoning_buf += text
+            now = time.monotonic()
+            if now - self._reasoning_at < self._REASONING_INTERVAL:
+                return
+            self._reasoning_at, self._reasoning_sent, preview = now, len(self._reasoning_buf), self._reasoning_buf
+        self._relay("subagent.thinking", preview=preview)
+
+    def _flush_reasoning(self) -> None:
+        """Relay the unsent tail of the current segment, then start a new one."""
+        with self._reasoning_lock:
+            preview = self._reasoning_buf if len(self._reasoning_buf) > self._reasoning_sent else ""
+            self._reasoning_buf, self._reasoning_sent, self._reasoning_at = "", 0, 0.0
+        if preview:
+            self._relay("subagent.thinking", preview=preview)
+
     # ── Lifecycle events emitted by the orchestrator itself ──
     def _on_spawn_requested(self, tool_name, preview, args, kwargs):
         self._relay("subagent.spawn_requested", preview=preview or self.goal_label or "", **kwargs)
@@ -372,6 +398,7 @@ class _ChildProgressRelay:
                 platform=getattr(parent, "_notification_platform", getattr(parent, "platform", "cli")),
                 user_config=getattr(parent, "_notification_config", None),
             )
+        self._flush_reasoning()
         self._relay("subagent.complete", preview=preview, **kwargs)
 
     def _on_text(self, tool_name, preview, args, kwargs):
@@ -409,6 +436,7 @@ class _ChildProgressRelay:
             short = _short(preview, 35) if preview else ""
             self._tree_line(f'{line}  "{short}"' if short else line)
         if self.parent_cb:
+            self._flush_reasoning()
             self._relay("subagent.tool", tool_name, preview, args)
             self.batch.append(tool_name or "")
             if len(self.batch) >= self._BATCH_SIZE:
