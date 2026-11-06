@@ -19,6 +19,10 @@ from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.helpers import typing_metadata_for_turn
+from gateway.run_turn_thinking import (
+    PUBLISH_INTERVAL, SUBAGENT_EVENTS, ThoughtAccumulator, active_background_children, apply_thinking_event,
+    arm_thinking_cards, spawn_background_follower, subagent_card_event, thinking_cards_enabled,
+)
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
@@ -102,7 +106,15 @@ def publish_worker_tool_event(authority, session_id, generation, frame) -> bool:
     return True
 
 
+def _thinking_cards_enabled(adapter) -> bool:
+    return thinking_cards_enabled(adapter)
+
+
 class GatewayTurnProgressMixin:
+    # thinking_task_cards state, armed per turn by ``_arm_thinking_cards`` (agent thread).
+    _thoughts: Optional[ThoughtAccumulator] = None
+    _background_card_follow = False
+
     # ── shared thread→loop plumbing ─────────────────────────────────────────────────────────
 
     def _schedule(self, coro, log_message: str, loop=None):
@@ -157,6 +169,9 @@ class GatewayTurnProgressMixin:
                 logger.debug("Local viewer progress publish failed for %s", event_type, exc_info=True)
         # Failed subagent → one clean user-facing notice, handled FIRST, before every progress-queue
         # gate: platforms with tool_progress off must still hear about a dead delegation.
+        if event_type in SUBAGENT_EVENTS and self._background_card_follow:
+            # Before the run-current gate: background children outlive the turn.
+            ctx.progress_queue.put(subagent_card_event(event_type, tool_name, preview, kwargs))
         if event_type == "subagent.complete":
             self._progress_subagent_notice(preview, kwargs)
             return
@@ -366,21 +381,31 @@ class GatewayTurnProgressMixin:
         # dynamically so the state is visible where it lives.
         publication_suppressed: bool = False
         anonymous_seq: int = 0
+        # thinking_task_cards: thought/subagent rows, full task list to the adapter
+        thinking: bool = False
+        subagents_running: set = dataclasses.field(default_factory=set)
+        subagent_segments: dict = dataclasses.field(default_factory=dict)
+        subagent_tools: dict = dataclasses.field(default_factory=dict)
+        delegation_id: str = ""
 
         @staticmethod
         def _compact(value: Any, limit: int = 120) -> str:
             text = re.sub(r"\s+", " ", str(value or "")).strip()
             return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
 
+        def all_tasks(self) -> list[dict[str, str]]:
+            return [self.tasks[task_id] for task_id in self.task_order]
+
         def visible_tasks(self) -> list[dict[str, str]]:
-            return [self.tasks[task_id] for task_id in self.task_order[-8:]]
+            # Thinking cards fold the whole list (the adapter caps it); the stream card shows a window.
+            return self.all_tasks() if self.thinking else [self.tasks[task_id] for task_id in self.task_order[-8:]]
 
         def fallback_text(self) -> str:
             labels = {"in_progress": t("gateway.progress.task_status_running"),
                       "complete": t("gateway.progress.task_status_complete"),
                       "error": t("gateway.progress.task_status_error")}
             lines = [t("gateway.progress.task_line", title=task["title"], status=labels.get(task["status"], task["status"]))
-                     for task in self.visible_tasks()]
+                     for task in self.visible_tasks()[-8:]]
             return t("gateway.progress.task_card_title") + "\n" + "\n".join(lines)
 
         def _upsert(self, call_id: str, title: str) -> dict[str, str]:
@@ -390,6 +415,9 @@ class GatewayTurnProgressMixin:
             return self.tasks[call_id]
 
         def apply_event(self, raw: Any) -> bool:
+            handled = apply_thinking_event(self, raw) if self.thinking else None
+            if handled is not None:
+                return handled
             event_type = raw.get("type") if isinstance(raw, dict) else None
             if event_type not in {"tool.started", "tool.completed"}:
                 return False
@@ -534,8 +562,10 @@ class GatewayTurnProgressMixin:
         See #29483.
         """
         ctx = self._ctx
-        st = self._TaskCardState(adapter)
+        st = self._TaskCardState(adapter, thinking=_thinking_cards_enabled(adapter))
         try:
+            if st.thinking:
+                await self._thinking_card_loop(st)
             while ctx._run_still_current():
                 try:
                     raw = ctx.progress_queue.get_nowait()
@@ -559,6 +589,30 @@ class GatewayTurnProgressMixin:
                     raise
                 except Exception:
                     logger.debug("task-card stop failed during turn cleanup", exc_info=True)
+            self._task_card_handoff_background(adapter, st)
+
+    async def _thinking_card_loop(self, st) -> None:
+        """Coalesce queued events into at most one publish per ``PUBLISH_INTERVAL``; the last
+        frame is drained and published before the caller's ``finally`` folds the card."""
+        ctx = self._ctx
+        last_publish, dirty = 0.0, False
+        while ctx._run_still_current():
+            dirty = self._task_card_drain(st) or dirty
+            if dirty and time.monotonic() - last_publish >= PUBLISH_INTERVAL and not self._agent_interrupted():
+                await self._task_card_publish(st)
+                last_publish, dirty = time.monotonic(), False
+            await asyncio.sleep(0.1)
+        if (self._task_card_drain(st) or dirty) and not self._agent_interrupted():
+            await self._task_card_publish(st)
+
+    def _task_card_handoff_background(self, adapter, st) -> None:
+        """Background ``delegate_task`` children outlive the turn: hand their events to a follower."""
+        session_id = getattr(self._ctx.agent_holder[0], "session_id", None) if self._ctx.agent_holder else None
+        if (self._background_card_follow and not self._agent_interrupted()
+                and (st.subagents_running or active_background_children(session_id))):
+            spawn_background_follower(self, adapter, st, session_id)
+            return
+        self._background_card_follow = False
 
     # ── editable progress bubbles (progress-queue drain) ────────────────────────────────────
 
@@ -829,12 +883,32 @@ class GatewayTurnProgressMixin:
         """Queue an ID-correlated native progress start from the agent thread."""
         if not self._native_card_gate():
             return
+        if self._thoughts is not None:
+            self._thoughts.boundary()
         from agent.display import build_tool_preview
         name = str(tool_name or "tool")
         self._ctx.progress_queue.put({
             "type": "tool.started", "tool_call_id": str(call_id or ""), "tool_name": name,
             "preview": build_tool_preview(name, args or {}, max_len=64) or "",
         })
+
+    def _arm_thinking_cards(self, agent, want_interim_messages: bool) -> None:
+        """Route reasoning (and commentary the chat would drop) into this turn's thinking card."""
+        arm_thinking_cards(self, agent, want_interim_messages)
+
+    def native_reasoning_callback(self, text) -> None:
+        """Streamed reasoning → the current ``thought_<seq>`` row (updated in place)."""
+        event = self._thoughts.feed(str(text or "")) if self._thoughts is not None and self._native_card_gate() else None
+        if event is not None:
+            self._ctx.progress_queue.put(event)
+
+    def native_interim_callback(self, text, *, already_streamed: bool = False) -> None:
+        """Commentary the chat would not show (interim messages off) becomes a thought row."""
+        if already_streamed:
+            return
+        event = self._thoughts.interim(str(text or "")) if self._thoughts is not None and self._native_card_gate() else None
+        if event is not None:
+            self._ctx.progress_queue.put(event)
 
     def native_tool_complete_callback(self, call_id, tool_name, args, result):
         """Queue the matching native completion using the real tool-call ID."""
