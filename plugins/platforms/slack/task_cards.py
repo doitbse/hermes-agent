@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -29,7 +30,14 @@ _WINDOW_CHARS = 2800
 _TITLE_CHARS = 256
 _DETAILS_CHARS = 2000
 DEFAULT_BACKGROUND_LABEL = "Background subagent"
-_THOUGHT_PREFIX, _TOOL_PREFIX = "💭 ", "🔧 "
+_THOUGHT_PREFIX, _TOOL_PREFIX, _WARNING_PREFIX = "💭 ", "🔧 ", "⚠️ "
+# Characters a ``plan`` block (plain text) or a ``task_update`` title must never carry raw.
+_TITLE_MARKS_RE = re.compile(r"`|\*\*|__")
+# Markdown inline spans tokenized into ``rich_text`` styled runs.
+_BULLET_RE = re.compile(r"(?m)^\s*[-*]\s+")
+_INLINE_TOKEN_RE = re.compile(
+    r"`([^`\n]+)`|\*\*([^*\n]+)\*\*|__([^_\n]+)__|(?<!\*)\*([^\s*\n](?:[^*\n]*[^\s*\n])?)\*(?!\*)"
+)
 
 
 @dataclass
@@ -103,7 +111,12 @@ def _mrkdwn_escape(text: str) -> str:
 
 def _one_line(text: Any, limit: int) -> str:
     flat = " ".join(str(text or "").split())
-    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+    if len(flat) <= limit:
+        return flat
+    cut = flat[: limit - 1].rstrip()
+    if cut.count("`") % 2 == 1:
+        cut += "`"
+    return cut + "…"
 
 
 def _window_text(tasks: list[dict[str, Any]]) -> str:
@@ -111,7 +124,7 @@ def _window_text(tasks: list[dict[str, Any]]) -> str:
     No ``_..._`` wrapper: an underscore inside a snake_case identifier would end the italics."""
     thoughts = [task for task in tasks if is_thought(task)]
     if thoughts:
-        lines = [f"• {_mrkdwn_escape(_one_line(task.get('title'), _WINDOW_LINE_CHARS))}"
+        lines = [f"• {_mrkdwn_escape(_one_line(task.get('live_title') or task.get('title'), _WINDOW_LINE_CHARS))}"
                  for task in thoughts[-_WINDOW_ITEMS:]]
     else:
         lines = [f"• `{_mrkdwn_escape(_one_line(task.get('title'), _WINDOW_LINE_CHARS)).replace('`', chr(39))}`"
@@ -151,28 +164,53 @@ def live_blocks(stream: _NativeTaskCardStream, now: Optional[float] = None) -> t
 
 
 def folded_title(stream: _NativeTaskCardStream, now: Optional[float] = None) -> str:
+    """No leading checkmark: Slack's ``plan`` block already renders its own icon."""
     elapsed = format_elapsed((time.monotonic() if now is None else now) - stream.started_at)
     steps = _step_str(stream.step_count or len(stream.all_tasks))
     if stream.is_background:
-        return f"✓ {_background_label(stream)} finished · {elapsed} · {steps}"[:_TITLE_CHARS]
-    return f"✓ Thought for {elapsed} · {steps}"[:_TITLE_CHARS]
+        return f"{_background_label(stream)} finished · {elapsed} · {steps}"[:_TITLE_CHARS]
+    return f"Thought for {elapsed} · {steps}"[:_TITLE_CHARS]
+
+
+def markdown_to_rich_text(text: str) -> dict[str, Any]:
+    """Tokenize a bounded slice of markdown into a Slack ``rich_text`` block's inline spans."""
+    body = _BULLET_RE.sub("• ", str(text or ""))[:_DETAILS_CHARS]
+    elements: list[dict[str, Any]] = []
+    pos = 0
+    for m in _INLINE_TOKEN_RE.finditer(body):
+        if m.start() > pos:
+            elements.append({"type": "text", "text": body[pos:m.start()]})
+        if m.group(1) is not None:
+            elements.append({"type": "text", "text": m.group(1), "style": {"code": True}})
+        elif m.group(2) is not None or m.group(3) is not None:
+            elements.append({"type": "text", "text": m.group(2) or m.group(3), "style": {"bold": True}})
+        else:
+            elements.append({"type": "text", "text": m.group(4), "style": {"italic": True}})
+        pos = m.end()
+    if pos < len(body):
+        elements.append({"type": "text", "text": body[pos:]})
+    elements = [el for el in elements if el["text"]]
+    return {"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": elements}]}
 
 
 def _plan_task(task: dict[str, Any], idx: int) -> dict[str, Any]:
-    title = str(task.get("title") or "").strip()
-    prefix = _THOUGHT_PREFIX if is_thought(task) else _TOOL_PREFIX
-    if not title.startswith(prefix.strip()):
-        title = prefix + title
-    title = title[:_TITLE_CHARS]
+    """A ``plan`` task row never carries the error status (that turns the plan's own icon into
+    a warning triangle); failed tools stay visible via a ``⚠️`` title prefix instead."""
+    raw_title = str(task.get("title") or "").strip()
+    plain_body = _TITLE_MARKS_RE.sub("", raw_title).strip()
+    errored = task.get("status") == "error"
+    prefix = _THOUGHT_PREFIX if is_thought(task) else (_WARNING_PREFIX if errored else _TOOL_PREFIX)
+    title = raw_title if raw_title.startswith(prefix.strip()) else prefix + raw_title
+    # Slack renders plan task titles as plain text: drop any leftover markdown characters.
+    title = _TITLE_MARKS_RE.sub("", title)[:_TITLE_CHARS]
     entry: dict[str, Any] = {
         "task_id": str(task.get("id") or task.get("task_id") or f"step_{idx}"),
         "title": title,
-        "status": "error" if task.get("status") == "error" else "complete",
+        "status": "complete",
     }
     details = task.get("details")
-    if isinstance(details, str) and details.strip() and details.strip() != title:
-        entry["details"] = {"type": "rich_text", "elements": [{
-            "type": "rich_text_section", "elements": [{"type": "text", "text": details[:_DETAILS_CHARS]}]}]}
+    if isinstance(details, str) and details.strip() and details.strip() != plain_body:
+        entry["details"] = markdown_to_rich_text(details)
     return entry
 
 
@@ -216,6 +254,8 @@ async def fold(client, stream: _NativeTaskCardStream) -> None:
             channel=stream.channel, ts=stream.stream_ts, text=title, blocks=[plan_block(stream, title)])
     except Exception as exc:
         logger.info("[Slack] Thinking card plan fold rejected (%s); folding to a one-line summary", exc)
+        # No ``plan`` block here to render its own icon, so this one-line fallback adds its own.
+        fallback = f"✓ {title}"
         await client.chat_update(
-            channel=stream.channel, ts=stream.stream_ts, text=title,
-            blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": title, "verbatim": False}]}])
+            channel=stream.channel, ts=stream.stream_ts, text=fallback,
+            blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": fallback, "verbatim": False}]}])
