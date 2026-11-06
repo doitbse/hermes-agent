@@ -87,9 +87,20 @@ _SLACK_LINK_RE = re.compile(
 _SLACK_MENTION_RE = re.compile(
     r"<(@[A-Z0-9]+|#[A-Z0-9]+|!subteam\^[A-Z0-9]+|!(?:here|channel|everyone))(?:\|[^>]*)?>"
 )
-_BOLD_RE = re.compile(r"(?:\*\*|__)(.+?)(?:\*\*|__)")
-_ITALIC_RE = re.compile(r"(?<![\*_])(?:\*|_)(?![\*_\s])(.+?)(?<![\*_\s])(?:\*|_)(?![\*_])")
+# Emphasis regexes are alternations; the span is always ``m.group(m.lastindex)``.
+# A closer never directly precedes another delimiter char, so ``***x***`` is bold(italic(x)).
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*(?!\*)|__(.+?)__(?!_)")
+# `_` never opens/closes intraword (CommonMark), so snake_case stays literal.
+_ITALIC_RE = re.compile(
+    r"(?<![\*_])\*(?![\*_\s])(.+?)(?<![\*_\s])\*(?![\*_])"
+    r"|(?<![\w\*_])_(?![\*_\s])(.+?)(?<![\*_\s])_(?![\w\*_])"
+)
 _STRIKE_RE = re.compile(r"~~(.+?)~~")
+_EMPHASIS = ((_BOLD_RE, "bold"), (_STRIKE_RE, "strike"), (_ITALIC_RE, "italic"))
+# Opaque tokens are swapped for \x00<index>\x00 before emphasis parsing; a raw
+# NUL in the input is shielded too so it can never forge a placeholder.
+_CODE_OR_NUL_RE = re.compile(_INLINE_CODE_RE.pattern + r"|\x00")
+_PLACEHOLDER_RE = re.compile(r"\x00(\d+)\x00")
 
 
 def _mention_element(body: str) -> Optional[dict[str, Any]]:
@@ -109,85 +120,110 @@ def _mention_element(body: str) -> Optional[dict[str, Any]]:
     return None
 
 
+# Shielded token: (kind, raw source, *payload). kind is code/text/link/mention.
+_Token = Tuple[str, ...]
+
+
+def _shield_tokens(text: str) -> Tuple[str, list[_Token]]:
+    """Swap opaque inline tokens for placeholders so emphasis can wrap them.
+    Code goes first, so link/mention/emphasis syntax inside backticks stays literal.
+    rich_text does not interpret mrkdwn, so Slack ``<url|label>`` and mentions are parsed here."""
+    tokens: list[_Token] = []
+
+    def put(token: _Token) -> str:
+        tokens.append(token)
+        return f"\x00{len(tokens) - 1}\x00"
+
+    def link(url: str, label: str, raw: str) -> str:
+        # A URL that swallowed a placeholder overlapped a code span: not a link.
+        return raw if "\x00" in url else put(("link", raw, url, label))
+
+    s = _CODE_OR_NUL_RE.sub(
+        lambda m: put(("code", m.group(0), m.group(1)) if m.group(1) else ("text", m.group(0))),
+        text)
+    s = _LINK_RE.sub(lambda m: link(m.group(2), m.group(1), m.group(0)), s)
+    s = _SLACK_LINK_RE.sub(lambda m: link(m.group(1), m.group(2) or m.group(1), m.group(0)), s)
+    s = _SLACK_MENTION_RE.sub(lambda m: put(("mention", m.group(0), m.group(1))), s)
+    return s, tokens
+
+
+def _full_emphasis(s: str) -> Optional[Tuple[str, str]]:
+    """``(style_key, inner)`` when one emphasis run spans all of ``s``, else None."""
+    for rx, key in _EMPHASIS:
+        m = rx.match(s)
+        if m and m.end() == len(s):
+            return key, m.group(m.lastindex)
+    return None
+
+
+def _link_label(label: str, tokens: list[_Token]) -> Tuple[str, dict[str, bool]]:
+    """Plain label text + style for a link element (which takes one ``text`` and one ``style``).
+    Wrapping emphasis runs and any code span inside the label become style flags."""
+    style: dict[str, bool] = {}
+    while (wrapped := _full_emphasis(label)) is not None and wrapped[0] not in style:
+        style[wrapped[0]] = True
+        label = wrapped[1]
+
+    def unshield(m: re.Match) -> str:
+        tok = tokens[int(m.group(1))]
+        if tok[0] == "code":
+            style["code"] = True
+            return tok[2]
+        return _PLACEHOLDER_RE.sub(unshield, tok[1])  # a nested link's raw may hold code
+
+    return _PLACEHOLDER_RE.sub(unshield, label), style
+
+
+def _emit_text(elements: list[dict[str, Any]], s: str, style: dict[str, bool]) -> None:
+    if s:
+        elements.append({"type": "text", "text": s, **({"style": dict(style)} if style else {})})
+
+
+def _emit_token(elements: list[dict[str, Any]], tokens: list[_Token], tok: _Token,
+                style: dict[str, bool]) -> None:
+    kind = tok[0]
+    if kind == "code":
+        _emit_text(elements, tok[2], {**style, "code": True})
+    elif kind == "link":
+        text, label_style = _link_label(tok[3], tokens)
+        merged = {**style, **label_style}
+        elements.append({
+            "type": "link", "url": tok[2], "text": text, **({"style": merged} if merged else {})})
+    elif kind == "mention" and (mention := _mention_element(tok[2])) is not None:
+        # Slack rejects ``style`` on user/channel/usergroup/broadcast elements.
+        elements.append(mention)
+    else:
+        _emit_text(elements, tok[1], style)
+
+
+def _walk_emphasis(elements: list[dict[str, Any]], tokens: list[_Token], s: str,
+                   style: dict[str, bool]) -> None:
+    """Split ``s`` on bold, then strike, then italic; expand placeholders at the leaves."""
+    if not s:
+        return
+    for rx, key in _EMPHASIS:
+        m = rx.search(s)
+        if m:
+            _walk_emphasis(elements, tokens, s[: m.start()], style)
+            _walk_emphasis(elements, tokens, m.group(m.lastindex), {**style, key: True})
+            _walk_emphasis(elements, tokens, s[m.end() :], style)
+            return
+    pos = 0
+    for m in _PLACEHOLDER_RE.finditer(s):
+        _emit_text(elements, s[pos : m.start()], style)
+        _emit_token(elements, tokens, tokens[int(m.group(1))], style)
+        pos = m.end()
+    _emit_text(elements, s[pos:], style)
+
+
 def _inline_elements(text: str) -> list[dict[str, Any]]:
     """Parse a run of inline markdown into rich_text section child elements.
-    Produces ``text`` elements (optionally styled bold/italic/strike/code) and ``link`` elements.
-    Unmatched markup is emitted verbatim as plain text, so this never loses characters."""
+    Produces ``text`` elements (optionally styled bold/italic/strike/code), ``link`` elements and
+    unstyled mention elements. Unmatched markup is emitted verbatim as plain text, so this never
+    loses characters."""
     elements: list[dict[str, Any]] = []
-
-    def emit_text(s: str, style: Optional[dict[str, bool]] = None) -> None:
-        if not s:
-            return
-        el: dict[str, Any] = {"type": "text", "text": s}
-        if style:
-            el["style"] = style
-        elements.append(el)
-
-    # Tokenize by the highest-priority markers first using a single scan.
-    # We recursively split on code, then links, then emphasis to keep spans
-    # from overlapping incorrectly.
-    def walk(s: str, style: dict[str, bool]) -> None:
-        pos = 0
-        # inline code is opaque — no nested styling
-        for m in _INLINE_CODE_RE.finditer(s):
-            _walk_links(s[pos : m.start()], style)
-            emit_text(m.group(1), {**style, "code": True})
-            pos = m.end()
-        _walk_links(s[pos:], style)
-    def _emit_link(url: str, text: str, style: dict[str, bool]) -> None:
-        link_el: dict[str, Any] = {"type": "link", "url": url, "text": text}
-        if style:
-            link_el["style"] = dict(style)
-        elements.append(link_el)
-
-    def _walk_links(s: str, style: dict[str, bool]) -> None:
-        pos = 0
-        for m in _LINK_RE.finditer(s):
-            _walk_slack_links(s[pos : m.start()], style)
-            _emit_link(m.group(2), m.group(1), style)
-            pos = m.end()
-        _walk_slack_links(s[pos:], style)
-
-    def _walk_slack_links(s: str, style: dict[str, bool]) -> None:
-        # rich_text does not interpret mrkdwn. Agents often emit <url|label>
-        # (works in section/mrkdwn; was literal in lists/quotes/table cells).
-        # Mention labels are dropped from the element anyway; strip them first
-        # so a label like |dev_ops_alerts is not split by the italic regex.
-        s = _SLACK_MENTION_RE.sub(lambda m: f"<{m.group(1)}>", s)
-        pos = 0
-        for m in _SLACK_LINK_RE.finditer(s):
-            _walk_emphasis(s[pos : m.start()], style)
-            url = m.group(1)
-            _emit_link(url, m.group(2) or url, style)
-            pos = m.end()
-        _walk_emphasis(s[pos:], style)
-    def _walk_emphasis(s: str, style: dict[str, bool]) -> None:
-        if not s:
-            return
-        # Try bold, then strike, then italic, recursing into the inner span.
-        for rx, key in ((_BOLD_RE, "bold"), (_STRIKE_RE, "strike"), (_ITALIC_RE, "italic")):
-            m = rx.search(s)
-            if m:
-                _walk_emphasis(s[: m.start()], style)
-                inner_style = dict(style)
-                inner_style[key] = True
-                _walk_emphasis(m.group(1), inner_style)
-                _walk_emphasis(s[m.end() :], style)
-                return
-        # Base case: split on mention tokens at the leaf so emphasis spans
-        # wrapping a mention are kept intact, while mentions themselves
-        # remain unstyled (Slack rejects styled mention elements).
-        pos = 0
-        for m in _SLACK_MENTION_RE.finditer(s):
-            emit_text(s[pos : m.start()], dict(style) if style else None)
-            element = _mention_element(m.group(1))
-            if element is not None:
-                elements.append(element)
-            else:
-                emit_text(m.group(0), dict(style) if style else None)
-            pos = m.end()
-        emit_text(s[pos:], dict(style) if style else None)
-    walk(text, {})
+    shielded, tokens = _shield_tokens(text)
+    _walk_emphasis(elements, tokens, shielded, {})
     return elements or [{"type": "text", "text": text}]
 
 
