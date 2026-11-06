@@ -1,5 +1,7 @@
 """Unit tests for the Slack Block Kit renderer (pure function, no adapter)."""
 
+import pytest
+
 from plugins.platforms.slack.block_kit import (
     MAX_BLOCKS,
     MAX_SECTION_TEXT,
@@ -181,6 +183,153 @@ class TestSlackMentions:
         assert not any("~~" in (e.get("text") or "") for e in els)
         assert {"type": "broadcast", "range": "here"} in els
         assert any(e.get("text") == "hi " and e.get("style", {}).get("strike") for e in els)
+
+
+def _list_item(md):
+    blocks = render_blocks(md)
+    assert blocks is not None
+    return blocks[0]["elements"][0]["elements"][0]["elements"]
+
+
+def _quote(md):
+    blocks = render_blocks(md)
+    assert blocks is not None and blocks[0]["elements"][0]["type"] == "rich_text_quote"
+    return blocks[0]["elements"][0]["elements"]
+
+
+def _table_cell(cell_md):
+    # _TABLE_SEP_RE requires >= 2 columns, so pad with a throwaway second column.
+    blocks = render_blocks(f"| h | h2 |\n| --- | --- |\n| {cell_md} | x |")
+    assert blocks is not None and blocks[0]["type"] == "table"
+    return blocks[0]["rows"][1][0]["elements"][0]["elements"]
+
+
+def _no_literal_markup(els, marks=("**", "__", "~~", "`", "](", "<http")):
+    for e in els:
+        if e.get("type") in ("text", "link"):
+            assert not any(m in e["text"] for m in marks), e
+
+
+class TestEmphasisWrappingOpaqueTokens:
+    """Emphasis must survive wrapping inline code, links and mentions.
+
+    Code/link spans used to be split off before emphasis parsing, leaving the
+    opening ``**`` in one slice and the closing ``**`` in the other, so both
+    rendered as literal text.
+    """
+
+    def test_bold_wrapping_code_then_slack_link_in_bullet(self):
+        els = _list_item(
+            "- **Upstream Chromium / `browser_exec` bug filed:** "
+            "<https://github.com/NousResearch/hermes-agent/issues/150314|NousResearch/hermes-agent#150314>"
+        )
+        assert els == [
+            {"type": "text", "text": "Upstream Chromium / ", "style": {"bold": True}},
+            {"type": "text", "text": "browser_exec", "style": {"bold": True, "code": True}},
+            {"type": "text", "text": " bug filed:", "style": {"bold": True}},
+            {"type": "text", "text": " "},
+            {
+                "type": "link",
+                "url": "https://github.com/NousResearch/hermes-agent/issues/150314",
+                "text": "NousResearch/hermes-agent#150314",
+            },
+        ]
+
+    @pytest.mark.parametrize("extract", [_list_item, _quote, _table_cell], ids=["list", "quote", "cell"])
+    @pytest.mark.parametrize(
+        "md, key",
+        [("**see `x_y` now**", "bold"), ("__see `x_y` now__", "bold"),
+         ("*see `x_y` now*", "italic"), ("_see `x_y` now_", "italic"),
+         ("~~see `x_y` now~~", "strike")],
+    )
+    def test_emphasis_wrapping_code_in_rich_text_containers(self, extract, md, key):
+        prefix = {_list_item: "- ", _quote: "> ", _table_cell: ""}[extract]
+        els = extract(prefix + md)
+        assert els == [
+            {"type": "text", "text": "see ", "style": {key: True}},
+            {"type": "text", "text": "x_y", "style": {key: True, "code": True}},
+            {"type": "text", "text": " now", "style": {key: True}},
+        ]
+
+    @pytest.mark.parametrize(
+        "link", ["[the docs](https://example.com/a_b)", "<https://example.com/a_b|the docs>"],
+        ids=["markdown", "slack"],
+    )
+    @pytest.mark.parametrize("delim, key", [("**", "bold"), ("*", "italic"), ("~~", "strike")])
+    def test_emphasis_wrapping_sole_and_mixed_links(self, link, delim, key):
+        expected_link = {
+            "type": "link", "url": "https://example.com/a_b", "text": "the docs", "style": {key: True}}
+        assert _list_item(f"- {delim}{link}{delim}") == [expected_link]
+        assert _list_item(f"- {delim}See {link} now{delim}") == [
+            {"type": "text", "text": "See ", "style": {key: True}},
+            expected_link,
+            {"type": "text", "text": " now", "style": {key: True}},
+        ]
+
+    def test_link_label_code_and_emphasis_move_into_link_style(self):
+        els = _list_item(
+            "- [`code`](https://e.com/1) [**bold**](https://e.com/2) "
+            "<https://e.com/3|***both***> **[_it_ `x`](https://e.com/4)**"
+        )
+        links = [e for e in els if e["type"] == "link"]
+        assert links == [
+            {"type": "link", "url": "https://e.com/1", "text": "code", "style": {"code": True}},
+            {"type": "link", "url": "https://e.com/2", "text": "bold", "style": {"bold": True}},
+            {"type": "link", "url": "https://e.com/3", "text": "both",
+             "style": {"bold": True, "italic": True}},
+            {"type": "link", "url": "https://e.com/4", "text": "_it_ x",
+             "style": {"bold": True, "code": True}},
+        ]
+        _no_literal_markup(els, marks=("**", "`", "]("))
+
+    def test_triple_emphasis_wrapping_code(self):
+        assert _list_item("- ***bold italic with `code`***") == [
+            {"type": "text", "text": "bold italic with ", "style": {"bold": True, "italic": True}},
+            {"type": "text", "text": "code", "style": {"bold": True, "italic": True, "code": True}},
+        ]
+
+    def test_nested_italic_and_code_inside_bold(self):
+        assert _list_item("- **bold with _italic_ and `code`**") == [
+            {"type": "text", "text": "bold with ", "style": {"bold": True}},
+            {"type": "text", "text": "italic", "style": {"bold": True, "italic": True}},
+            {"type": "text", "text": " and ", "style": {"bold": True}},
+            {"type": "text", "text": "code", "style": {"bold": True, "code": True}},
+        ]
+
+    @pytest.mark.parametrize(
+        "code", ["foo_bar_baz", "**not bold**", "a ** b", "<@U123>", "a[0](1)", "<https://x.com|y>"]
+    )
+    def test_code_span_contents_stay_literal_inside_and_outside_bold(self, code):
+        assert _list_item(f"- `{code}`") == [{"type": "text", "text": code, "style": {"code": True}}]
+        assert _list_item(f"- **see `{code}` here**") == [
+            {"type": "text", "text": "see ", "style": {"bold": True}},
+            {"type": "text", "text": code, "style": {"bold": True, "code": True}},
+            {"type": "text", "text": " here", "style": {"bold": True}},
+        ]
+
+    def test_snake_case_beside_code_is_not_italicized(self):
+        els = _list_item("- set `max_tokens` in my_config_file and foo_bar")
+        assert not any(e.get("style", {}).get("italic") for e in els)
+        assert "".join(e["text"] for e in els) == "set max_tokens in my_config_file and foo_bar"
+
+    def test_emphasis_wrapping_mention_and_code_keeps_mention_unstyled(self):
+        els = _list_item("- **hello <@U123> run `deploy` <#C9|ops_room> world**")
+        assert els == [
+            {"type": "text", "text": "hello ", "style": {"bold": True}},
+            {"type": "user", "user_id": "U123"},
+            {"type": "text", "text": " run ", "style": {"bold": True}},
+            {"type": "text", "text": "deploy", "style": {"bold": True, "code": True}},
+            {"type": "text", "text": " ", "style": {"bold": True}},
+            {"type": "channel", "channel_id": "C9"},
+            {"type": "text", "text": " world", "style": {"bold": True}},
+        ]
+
+    def test_unclosed_markup_and_nul_are_preserved_verbatim(self):
+        md = "**open `code` [x](`u`) \x00 tail"
+        els = _list_item(f"- {md}")
+        rendered = "".join(
+            f"`{e['text']}`" if e.get("style", {}).get("code") else e["text"] for e in els)
+        assert rendered == md
 
 
 class TestTables:
