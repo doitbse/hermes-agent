@@ -34,7 +34,7 @@ from pathlib import Path as _Path
 
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
-from agent.compression_marker import ELISION_MARKER_MAX_LEN, elide
+from agent.compression_marker import elide
 from agent.i18n import t
 from agent.retry_utils import parse_retry_after_seconds
 from agent.secret_scope import get_secret
@@ -48,6 +48,7 @@ from gateway.platforms.base_log_safety import safe_url_for_log
 from gateway.platforms.helpers import MessageDeduplicator
 from plugins.platforms.slack.adapter_config_readers import (
     _extra_or_env_channel_set_getter, _extra_or_env_flag_getter)
+from plugins.platforms.slack.adapter_unfurls import append_link_unfurls
 from gateway.platforms.base import (
     gateway_trust_env, BasePlatformAdapter, ExecApprovalPrompt,
     SendResult, SUPPORTED_DOCUMENT_TYPES, SUPPORTED_VIDEO_TYPES, _TEXT_INJECT_EXTENSIONS,
@@ -551,11 +552,6 @@ def _extract_text_from_slack_blocks(blocks: list) -> str:
 #: with whatever was pasted. 20k chars comfortably covers real tables while
 #: staying well under Slack's own 40k message ceiling.
 _SLACK_TABLE_MAX_CHARS = 20_000
-#: One ceiling for every ``attachments[].blocks[]`` projection in a message. Slack allows 20
-#: attachments each with its own blocks, so a per-attachment cap alone still grows 20x; the
-#: top-level ``blocks`` path is capped once (``_serialize_slack_blocks_for_agent``) and this
-#: keeps the unfurl path in the same order of magnitude.
-_SLACK_UNFURL_BLOCKS_MAX_CHARS = 6000
 
 
 def _collect_slack_table_cell_text(value: Any) -> str:
@@ -621,8 +617,8 @@ def _extract_text_from_slack_attachments(attachments: list) -> str:
     for att in attachments:
         if not isinstance(att, dict):
             continue
-        # Permalink unfurls repeat a message the agent already reads (inbound path skips them too).
-        if att.get("is_msg_unfurl"):
+        # Permalink unfurls repeat a message the agent already reads; shares (is_share) carry a forwarded message.
+        if att.get("is_msg_unfurl") and not att.get("is_share"):
             continue
         got: list[str] = [str(att[key]) for key in ("pretext", "title", "text") if att.get(key)]
         for field in att.get("fields", []) or []:
@@ -4239,56 +4235,7 @@ class SlackAdapter(BasePlatformAdapter):
             normalized_event["_slack_changed_event_ts"] = changed_event_ts
         return normalized_event
 
-    @staticmethod
-    def _append_link_unfurls(text: str, slack_attachments: list) -> str:
-        """Append link-unfurl previews (``attachments``) to ``text``; ``is_msg_unfurl`` echoes our
-        own content and is skipped. Dedup matches the rendered section, not the bare URL (which is
-        usually already in the user's text while the preview body is not)."""
-        att_parts: list[str] = []
-        blocks_budget = _SLACK_UNFURL_BLOCKS_MAX_CHARS
-        for att in slack_attachments:
-            att_title = att.get("title", "")
-            att_url = att.get("title_link", "") or att.get("from_url", "")
-            att_text = att.get("text", "")
-            att_footer = att.get("footer", "")
-            att_fallback = att.get("fallback", "")
-            if att.get("is_msg_unfurl"):
-                continue
-            if att_title and att_url:
-                header = f"📎 [{att_title}]({att_url})"
-            else:
-                header = f"📎 {att_title or att_url}" if (att_title or att_url) else None
-            body = (att_text or att_fallback or "").strip()
-            if len(body) > 500:
-                body = body[:497] + "..."
-            # Pasted tables arrive as ``table`` blocks in ``attachments[].blocks[]``, absent from
-            # ``text``/``fallback``/files; without this the agent sees only the sentence before them.
-            # The budget is shared across the whole array: a 20-attachment alert must not project
-            # 20x what a single one does, and a spent budget still leaves the header visible.
-            nested_text = ""
-            if blocks_budget > 0:
-                nested_text = _extract_text_from_slack_blocks(att.get("blocks") or [])
-                if len(nested_text) > blocks_budget and blocks_budget <= ELISION_MARKER_MAX_LEN:
-                    nested_text = ""  # leftover budget cannot hold marker + content: skip, don't overshoot
-                nested_text = elide(nested_text, blocks_budget)
-            if nested_text and nested_text not in body:
-                blocks_budget -= len(nested_text)
-                body = f"{body}\n{nested_text}".strip() if body else nested_text
-            if header:
-                section = f"{header}\n   {body}" if body else header
-            elif body:
-                section = f"📎 {body}"
-            else:
-                continue
-            if section in text:
-                continue
-            if att_footer:
-                section = f"{section}\n   _{att_footer}_"
-            att_parts.append(section)
-        if att_parts:
-            text = (text.strip() + "\n\n" + "\n\n".join(att_parts)).strip()
-            logger.debug("Slack: appended %d link unfurl(s) to message text", len(att_parts))
-        return text
+    _append_link_unfurls = staticmethod(append_link_unfurls)
 
     def _session_thread_ts(
         self, event: dict, ts: str, is_dm: bool, assistant_meta: dict[str, str]) -> Optional[str]:
