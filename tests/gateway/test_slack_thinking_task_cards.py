@@ -70,7 +70,7 @@ async def test_two_phase_lifecycle_posts_updates_then_folds_to_plan(monkeypatch)
     fold = client.chat_update.await_args.kwargs
     (plan,) = fold["blocks"]
     assert plan["type"] == "plan"
-    assert plan["title"].startswith("✓ Thought for ") and plan["title"].endswith("· 3 steps")
+    assert plan["title"].startswith("Thought for ") and plan["title"].endswith("· 3 steps")
     assert fold["text"] == plan["title"]
     assert [task["title"] for task in plan["tasks"]] == [
         "💭 Check the read_file helper", "🔧 terminal - ls", "💭 Now compare"]
@@ -107,7 +107,8 @@ async def test_fold_caps_plan_at_fifty_tasks_and_keeps_errors(monkeypatch):
     assert len(plan["tasks"]) == 50
     assert plan["tasks"][0] == {"task_id": "omitted", "title": "(11 earlier steps omitted)", "status": "complete"}
     assert plan["tasks"][1]["task_id"] == "call-11"
-    assert plan["tasks"][-1]["status"] == "error"
+    assert plan["tasks"][-1]["status"] == "complete"
+    assert plan["tasks"][-1]["title"].startswith("⚠️ ")
 
 
 @pytest.mark.asyncio
@@ -124,6 +125,8 @@ async def test_rejected_plan_folds_to_one_line_context(monkeypatch):
     await adapter.send_native_task_card_progress("C1", [{"id": "a", "title": "x", "status": "complete"}], metadata=META)
     await adapter.stop_native_task_card_progress("C1", metadata=META)
     assert [c["blocks"][0]["type"] for c in calls] == ["plan", "context"]
+    assert not calls[0]["text"].startswith("✓ ")  # plan block renders its own icon
+    assert calls[-1]["text"].startswith("✓ Thought for ")  # one-line fallback adds its own
     assert block_texts(calls[-1]["blocks"]) == [calls[-1]["text"]]
 
 
@@ -143,7 +146,7 @@ async def test_background_stream_is_a_separate_card_with_its_own_fold(monkeypatc
     await adapter.stop_native_task_card_progress("C1", metadata=META, stream_suffix="d1")
     fold = client.chat_update.await_args.kwargs
     assert fold["ts"] == "300.1"
-    assert fold["text"].startswith("✓ Background subagent finished · ") and fold["text"].endswith("· 1 step")
+    assert fold["text"].startswith("Background subagent finished · ") and fold["text"].endswith("· 1 step")
     assert len(adapter._native_task_card_streams) == 1
 
 
@@ -164,9 +167,14 @@ def test_thought_accumulator_and_task_card_state_events():
     acc = ThoughtAccumulator()
     evt1 = acc.feed("**Inspecting config**\nChecking how `show_reasoning` is resolved.")
     assert evt1["thought_id"] == "thought_1"
-    assert evt1["title"].startswith("Inspecting config:")
+    assert evt1["title"] == "Inspecting config"
+    assert evt1["live_title"].startswith("*Inspecting config*: Checking how `show_reasoning`")
     evt1b = acc.feed(" Also checking `interim_assistant_messages`.")
     assert evt1b["thought_id"] == "thought_1"
+    # Post-stream full-buffer replay from _assistant_reasoning_text must not duplicate the thought.
+    replay = acc.feed("**Inspecting config**\nChecking how `show_reasoning` is resolved. Also checking `interim_assistant_messages`.")
+    assert len(replay["sections"]) == 1
+    assert replay["details"].count("Checking how") == 1
     acc.boundary()
     evt2 = acc.feed("Second thought segment after tool boundary.")
     assert evt2["thought_id"] == "thought_2"
@@ -192,4 +200,78 @@ def test_thought_accumulator_and_task_card_state_events():
     assert st.apply_event({"type": "subagent.complete", "subagent_id": "sa1", "status": "completed"})
     assert "sa1" not in st.subagents_running
     assert st.tasks["sub_sa1_tool_1"]["status"] == "complete"
+
+
+def test_gemini_bold_headings_split_into_multiple_thought_rows():
+    """Gemini-style thoughts: each bold heading starts a new section/row; the heading itself
+    (not any clause after it) is the row's title, and the body becomes that row's details."""
+    from gateway.run_turn_progress import GatewayTurnProgressMixin
+    from gateway.run_turn_thinking import ThoughtAccumulator, parse_thought_sections
+
+    text = ("**Reviewing PRs**\n\nChecking `repo/a`.\n\n"
+            "**Finding root causes**\n\nFound bug in `prs-check.py`.")
+    sections = parse_thought_sections(text)
+    assert [s["title"] for s in sections] == ["Reviewing PRs", "Finding root causes"]
+    assert sections[0]["details"] == "Checking `repo/a`."
+    assert sections[1]["details"] == "Found bug in `prs-check.py`."
+
+    acc = ThoughtAccumulator()
+    evt = acc.feed(text)
+    assert evt["title"] == "Reviewing PRs"
+    assert len(evt["sections"]) == 2
+
+    st = GatewayTurnProgressMixin._TaskCardState(adapter=None, thinking=True)
+    st.apply_event(evt)
+    assert st.tasks["thought_1"]["title"] == "Reviewing PRs"
+    assert st.tasks["thought_1"]["status"] == "complete"
+    assert st.tasks["thought_1_2"]["title"] == "Finding root causes"
+    assert st.tasks["thought_1_2"]["status"] == "in_progress"
+
+
+def test_claude_opus_unheaded_prose_uses_first_sentence_as_title():
+    """Claude Opus thoughts have no bold headings: the first sentence becomes the title and is
+    never repeated inside details; a single-sentence thought has no details at all."""
+    from gateway.run_turn_thinking import parse_thought_sections
+
+    sections = parse_thought_sections("Checking `config.yaml` first. Then we will inspect the service logs.")
+    assert sections[0]["title"] == "Checking config.yaml first."
+    assert sections[0]["details"] == "Then we will inspect the service logs."
+    assert sections[0]["live_title"] == "Checking `config.yaml` first."
+
+    single = parse_thought_sections("Just one sentence here.")
+    assert single[0]["title"] == "Just one sentence here."
+    assert single[0]["details"] == ""
+
+    multi = parse_thought_sections(
+        "First paragraph checks `thinking_task_cards`. It also verifies the flag.\n\n"
+        "- bullet one\n- bullet two\n\n"
+        "Second paragraph moves on to the test suite."
+    )
+    assert [s["title"] for s in multi] == [
+        "First paragraph checks thinking_task_cards.",
+        "Second paragraph moves on to the test suite.",
+    ]
+    assert "- bullet one" in multi[0]["details"]
+    assert multi[1]["details"] == ""
+
+
+@pytest.mark.asyncio
+async def test_fold_tokenizes_markdown_details_and_strips_heading_from_title(monkeypatch):
+    """Both scenarios above fold into ``plan`` rows: headings stay in the title (prefixed
+    once with 💭), and `code` spans inside details become ``rich_text`` code-styled runs."""
+    adapter, client = make_adapter(monkeypatch)
+    tasks = [
+        {"id": "thought_1", "kind": "thought", "title": "Reviewing PRs", "status": "complete",
+         "details": "Checking `repo/a`."},
+        {"id": "thought_1_2", "kind": "thought", "title": "Finding root causes", "status": "complete",
+         "details": "Found bug in `prs-check.py`."},
+    ]
+    await adapter.send_native_task_card_progress("C1", tasks, metadata=META)
+    await adapter.stop_native_task_card_progress("C1", metadata=META)
+    (plan,) = client.chat_update.await_args.kwargs["blocks"]
+    assert [t["title"] for t in plan["tasks"]] == ["💭 Reviewing PRs", "💭 Finding root causes"]
+    details0 = plan["tasks"][0]["details"]["elements"][0]["elements"]
+    assert {"type": "text", "text": "repo/a", "style": {"code": True}} in details0
+    details1 = plan["tasks"][1]["details"]["elements"][0]["elements"]
+    assert {"type": "text", "text": "prs-check.py", "style": {"code": True}} in details1
 
