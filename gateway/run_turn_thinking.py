@@ -32,6 +32,17 @@ SUBAGENT_EVENTS = frozenset({"subagent.start", "subagent.thinking", "subagent.to
 _BOLD_HEAD = re.compile(r"^\s*(\*\*|\*|__)(.+?)\1\s*[:.\-–—]?\s*(.*)$", re.S)
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s|\n")
 _CLAUSE_END = re.compile(r"[.!?;,]\s|\n")
+# A heading line of its own (bold/underline/markdown), or a bold heading immediately followed
+# by ``:``/``-`` and same-line body text (e.g. Gemini's ``**Finding root causes**: ...``).
+_HEADING_RE = re.compile(
+    r"(?m)^[ \t]*(?:"
+    r"\*\*(?P<h1>[^*\n]+)\*\*[ \t]*$"
+    r"|__(?P<h2>[^_\n]+)__[ \t]*$"
+    r"|#+[ \t]*(?P<h3>[^\n]+)$"
+    r"|\*\*(?P<h4>[^*\n]+)\*\*[ \t]*[:.\-–—][ \t]*(?P<b4>.*)$"
+    r")"
+)
+_TITLE_MARKS_RE = re.compile(r"(?m)`|\*\*|__|^\s*#+\s*")
 
 _background_tasks: set[asyncio.Task] = set()
 
@@ -45,7 +56,12 @@ def _strip_marks(text: str) -> str:
 
 
 def _cap(text: str) -> str:
-    return text if len(text) <= _TITLE_CHARS else text[: _TITLE_CHARS - 1].rstrip() + "…"
+    if len(text) <= _TITLE_CHARS:
+        return text
+    cut = text[: _TITLE_CHARS - 1].rstrip()
+    if cut.count("`") % 2 == 1:
+        cut += "`"
+    return cut + "…"
 
 
 def thought_title(text: str) -> str:
@@ -63,6 +79,72 @@ def thought_title(text: str) -> str:
     return _cap(_strip_marks(_SENTENCE_END.split(" ".join(lines), 1)[0]))
 
 
+def _clean_plain(text: str) -> str:
+    """Plain-text title: markdown/code marks removed, whitespace collapsed."""
+    return re.sub(r"\s+", " ", _TITLE_MARKS_RE.sub("", text)).strip()
+
+
+def _headed_section(heading: str, body: str) -> dict[str, str]:
+    """Case A: a bold/markdown heading followed by body text (Gemini-style thoughts)."""
+    heading = re.sub(r"\s+", " ", heading).strip()
+    details = re.sub(r"^[\s:\-–—]+", "", body).strip()[:_DETAILS_CHARS]
+    title = _cap(_clean_plain(heading))
+    if details:
+        first_sent = _SENTENCE_END.split(details, 1)[0].strip()
+        live_title = _cap(f"*{heading}*: {first_sent}")
+    else:
+        live_title = _cap(f"*{heading}*")
+    return {"title": title, "details": details, "live_title": live_title}
+
+
+def _prose_section(text: str) -> dict[str, str]:
+    """Case B: unheaded prose (Claude Opus-style thoughts), split at the first sentence."""
+    stripped = text.strip()
+    parts = _SENTENCE_END.split(stripped, 1)
+    first_sent = parts[0].strip()
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    return {"title": _cap(_clean_plain(first_sent)), "details": rest[:_DETAILS_CHARS],
+            "live_title": _cap(first_sent)}
+
+
+_CONTINUATION_BLOCK_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)]|```)\s*")
+
+
+def _unheaded_sections(text: str) -> list[dict[str, str]]:
+    """Split unheaded prose on blank-line paragraph boundaries, keeping list/code blocks attached."""
+    paragraphs: list[str] = []
+    for raw_block in re.split(r"\n[ \t]*\n+", text.strip()):
+        block = raw_block.strip()
+        if not block:
+            continue
+        if paragraphs and _CONTINUATION_BLOCK_RE.match(block):
+            paragraphs[-1] = f"{paragraphs[-1]}\n\n{block}"
+        else:
+            paragraphs.append(block)
+    return [_prose_section(p) for p in (paragraphs or [text])]
+
+
+def parse_thought_sections(text: str) -> list[dict[str, str]]:
+    """Split a raw thought into sections at each bold/markdown heading (Gemini); absent any
+    heading, split on blank-line prose paragraph boundaries (Claude Opus thinking)."""
+    text = str(text or "")
+    matches = list(_HEADING_RE.finditer(text))
+    if not matches:
+        return _unheaded_sections(text)
+    sections: list[dict[str, str]] = []
+    if matches[0].start() > 0 and text[: matches[0].start()].strip():
+        sections.extend(_unheaded_sections(text[: matches[0].start()]))
+    for i, m in enumerate(matches):
+        heading = next(g for g in (m.group("h1"), m.group("h2"), m.group("h3"), m.group("h4"))
+                       if g is not None)
+        same_line = m.group("b4") or ""
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        rest = text[m.end():end]
+        body = f"{same_line}\n{rest}" if same_line else rest
+        sections.append(_headed_section(heading, body))
+    return sections or _unheaded_sections(text)
+
+
 class ThoughtAccumulator:
     """Streamed reasoning per segment; a tool start opens the next ``thought_<seq>`` row."""
 
@@ -76,13 +158,18 @@ class ThoughtAccumulator:
         if not text:
             return None
         with self._lock:
-            self._buf += text
+            # _assistant_reasoning_text replays the full reasoning block after streaming when
+            # stream_delta_callback is unset; replace (rather than double) on full-buffer replay.
+            if self._buf and re.sub(r"\s+", " ", self._buf).strip() == re.sub(r"\s+", " ", text).strip():
+                self._buf = text
+            else:
+                self._buf += text
             full, seq = self._buf, self._seq
-        title = thought_title(full)
-        if not title:
+        sections = parse_thought_sections(full)
+        if not sections or not sections[0]["title"]:
             return None
-        return {"type": "thinking.updated", "thought_id": f"thought_{seq}", "title": title,
-                "details": full[:_DETAILS_CHARS]}
+        return {"type": "thinking.updated", "thought_id": f"thought_{seq}", "title": sections[0]["title"],
+                "live_title": sections[0]["live_title"], "details": sections[0]["details"], "sections": sections}
 
     def boundary(self) -> None:
         with self._lock:
@@ -91,14 +178,14 @@ class ThoughtAccumulator:
                 self._buf = ""
 
     def interim(self, text: str) -> Optional[dict[str, Any]]:
-        title = thought_title(text)
-        if not title:
+        sections = parse_thought_sections(text)
+        if not sections or not sections[0]["title"]:
             return None
         with self._lock:
             self._interim_seq += 1
             seq = self._interim_seq
-        return {"type": "thinking.updated", "thought_id": f"interim_{seq}", "title": title,
-                "details": str(text)[:_DETAILS_CHARS]}
+        return {"type": "thinking.updated", "thought_id": f"interim_{seq}", "title": sections[0]["title"],
+                "live_title": sections[0]["live_title"], "details": sections[0]["details"], "sections": sections}
 
 
 def chain_callbacks(*callbacks: Optional[Callable]) -> Optional[Callable]:
@@ -175,12 +262,23 @@ def _put(st, task_id: str, **fields) -> dict[str, Any]:
     return st.tasks[task_id]
 
 
+def _apply_sections(st, base_id: str, sections: list[dict[str, str]], owner: str) -> None:
+    """Upsert one task row per thought section; only the last section stays ``in_progress``."""
+    if base_id not in st.tasks:
+        _settle_running(st, kind="thought", owner=owner)
+    last = len(sections) - 1
+    for idx, section in enumerate(sections):
+        task_id = base_id if idx == 0 else f"{base_id}_{idx + 1}"
+        _put(st, task_id, kind="thought", owner=owner, status="complete" if idx != last else "in_progress",
+             title=st._compact(section.get("title") or "…", 180),
+             live_title=str(section.get("live_title") or section.get("title") or "…"),
+             details=str(section.get("details") or ""))
+
+
 def _apply_thought(st, raw: dict) -> bool:
-    task_id = str(raw.get("thought_id") or "thought")
-    if task_id not in st.tasks:
-        _settle_running(st, kind="thought", owner="")
-    _put(st, task_id, kind="thought", owner="", title=st._compact(raw.get("title"), 180),
-         details=str(raw.get("details") or ""))
+    base_id = str(raw.get("thought_id") or "thought")
+    sections = raw.get("sections") or parse_thought_sections(raw.get("title") or raw.get("details") or "")
+    _apply_sections(st, base_id, sections, owner="")
     return True
 
 
@@ -193,11 +291,8 @@ def _apply_subagent(st, raw: dict) -> bool:
         _put(st, f"sub_{sid}", kind="tool", owner=sid, title=f"subagent - {goal}" if goal else "subagent")
     elif event_type == "subagent.thinking":
         seq = st.subagent_segments.setdefault(sid, 1)
-        task_id = f"thought_sub_{sid}_{seq}"
-        if task_id not in st.tasks:
-            _settle_running(st, kind="thought", owner=sid)
-        _put(st, task_id, kind="thought", owner=sid, title=thought_title(raw.get("preview") or "") or "…",
-             details=str(raw.get("preview") or "")[:_DETAILS_CHARS])
+        base_id = f"thought_sub_{sid}_{seq}"
+        _apply_sections(st, base_id, parse_thought_sections(raw.get("preview") or ""), owner=sid)
     elif event_type == "subagent.tool":
         st.subagent_segments[sid] = st.subagent_segments.get(sid, 1) + 1
         st.subagent_tools[sid] = st.subagent_tools.get(sid, 0) + 1
