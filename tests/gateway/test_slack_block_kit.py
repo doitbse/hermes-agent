@@ -1,8 +1,12 @@
 """Unit tests for the Slack Block Kit renderer (pure function, no adapter)."""
 
 from plugins.platforms.slack.block_kit import (
+    _RICH_BUILDERS,
     MAX_BLOCKS,
+    MAX_RICH_TEXT_MESSAGE_CHARS,
     MAX_SECTION_TEXT,
+    _render_markdown,
+    estimate_text_chars,
     render_blocks,
     sanitize_blocks,
 )
@@ -351,5 +355,80 @@ class TestSplitTextFenceBalanced:
             assert chunk.count("```") % 2 == 0, (
                 f"chunk {i} has unbalanced fences: {chunk[:60]!r}"
             )
+
+
+def _long_nested_list_md(n=40):
+    return "\n".join(
+        f"{i}. **Item {i} title** see [ticket {i}](https://example.com/tracker/issues/{i:05d}?view=full)\n"
+        f"   - detail one for item {i} with [docs](https://docs.example.com/guide/section-{i})"
+        f" covering the owner, deadline and current status\n"
+        f"   - detail two for item {i} with `code_{i}` and more explanatory words describing the"
+        f" change, why it matters, and the follow-up actions the reviewer should take next"
+        for i in range(1, n + 1)
+    )
+
+
+def _section_text(blocks):
+    return "\n".join(b["text"]["text"] for b in blocks if b["type"] == "section")
+
+
+class TestRichTextMessageBudget:
+    """Once any rich_text block is present Slack caps the aggregate text of the whole message
+    (msg_blocks_too_long); over budget, the renderer degrades to mrkdwn sections."""
+
+    def test_estimate_counts_link_urls(self):
+        url = "https://example.com/" + "x" * 80
+        blocks = render_blocks(f"- [a]({url})")
+        assert estimate_text_chars(blocks) >= len(url) + 1
+        section = {"type": "section", "text": {"type": "mrkdwn", "text": "abc"}}
+        assert estimate_text_chars([section]) == 4  # text + the line break Slack counts
+
+    def test_estimate_counts_emoji_at_shortcode_length(self):
+        # Slack counts 🚦 as :vertical_traffic_light: (24 chars) toward the budget.
+        section = {"type": "section", "text": {"type": "mrkdwn", "text": "🚦" * 10}}
+        assert estimate_text_chars([section]) >= 240
+
+    def test_emoji_heavy_list_degrades(self):
+        md = "\n".join(f"- item {i} 🚦🏗️✅ status 🚦" for i in range(200))
+        blocks = render_blocks(md)
+        assert blocks is not None
+        assert "rich_text" not in _types(blocks)
+
+    def test_long_nested_list_degrades_to_sections(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.slack.adapter import SlackAdapter
+
+        fmt = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake")).format_message
+        md = _long_nested_list_md()
+        rich = _render_markdown(md, fmt, _RICH_BUILDERS)
+        assert estimate_text_chars(rich) > MAX_RICH_TEXT_MESSAGE_CHARS  # premise
+
+        blocks = render_blocks(md, mrkdwn_fn=fmt)
+        assert blocks is not None
+        assert "rich_text" not in _types(blocks)
+        assert len(blocks) <= MAX_BLOCKS
+        assert all(len(b["text"]["text"]) <= MAX_SECTION_TEXT for b in blocks)
+        text = _section_text(blocks)
+        for i in range(1, 41):
+            assert f"{i}. *Item {i} title*" in text
+            assert f"detail two for item {i}" in text
+        assert "<https://example.com/tracker/issues/00007?view=full|ticket 7>" in text
+        assert "\u2003\u2003◦ detail one for item 7" in text
+        assert estimate_text_chars(blocks) < 2 * estimate_text_chars(rich)
+
+    def test_short_nested_list_keeps_rich_text_list(self):
+        blocks = render_blocks(_long_nested_list_md(3))
+        rich = next(b for b in blocks if b["type"] == "rich_text")
+        assert any(e["type"] == "rich_text_list" for e in rich["elements"])
+
+    def test_code_and_quote_render_as_sections_when_degraded(self):
+        md = (
+            "```python\nprint('hi')\n```\n\n> quoted line\n> second\n\n"
+            + _long_nested_list_md()
+        )
+        blocks = render_blocks(md)
+        assert "rich_text" not in _types(blocks)
+        assert blocks[0]["text"]["text"] == "```\nprint('hi')\n```"
+        assert blocks[1]["text"]["text"] == "> quoted line\n> second"
 
 
