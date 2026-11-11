@@ -149,6 +149,27 @@ class TestEditMessageBlocks:
         assert second["text"]
 
     @pytest.mark.asyncio
+    async def test_msg_blocks_too_long_retries_send_without_blocks(self):
+        adapter, client = _make_adapter({"rich_blocks": True})
+        client.chat_postMessage = AsyncMock(
+            side_effect=[SlackRejectedBlocks("msg_blocks_too_long"), {"ts": "111.222"}]
+        )
+
+        result = await adapter.send("C1", RICH_MD)
+
+        assert result.success is True
+        assert client.chat_postMessage.await_count == 2
+        first = client.chat_postMessage.await_args_list[0].kwargs
+        second = client.chat_postMessage.await_args_list[1].kwargs
+        assert first.get("blocks")
+        assert not second.get("blocks")
+        assert second["text"] == first["text"]
+
+    def test_msg_blocks_too_long_is_block_payload_rejection(self):
+        assert SlackAdapter._is_block_payload_rejection(SlackRejectedBlocks("msg_blocks_too_long"))
+        assert not SlackAdapter._is_block_payload_rejection(SlackRejectedBlocks("channel_not_found"))
+
+    @pytest.mark.asyncio
     async def test_timeout_error_on_edit_is_retryable_transient(self):
         adapter, client = _make_adapter()
         client.chat_update = AsyncMock(side_effect=TimeoutError("timed out"))
