@@ -39,6 +39,10 @@ MAX_HEADER_TEXT = 150
 MAX_TABLE_ROWS = 100
 MAX_TABLE_COLS = 20
 MAX_TABLE_CHARS = 10000  # aggregate across all cells
+# Once any rich_text block is present, Slack rejects the message (msg_blocks_too_long) when the
+# aggregate text of ALL blocks, link URLs included, exceeds ~13.2k chars; sections alone are not
+# capped this way. Over budget, lists/quotes/code re-render as mrkdwn sections instead.
+MAX_RICH_TEXT_MESSAGE_CHARS = 12000
 
 Block = dict[str, Any]
 
@@ -308,6 +312,86 @@ def _section_block(text: str) -> Block:
 
 
 # ----------------------------------------------------------------------------
+# mrkdwn-section builders — used when rich_text would exceed the message budget
+# ----------------------------------------------------------------------------
+
+_BULLET_MARKERS = ("•", "◦", "▪")
+# Slack collapses leading ASCII spaces in mrkdwn; em spaces survive.
+_MRKDWN_INDENT = "\u2003\u2003"
+
+
+def _mrkdwn_sections(text: str) -> list[Block]:
+    return [_section_block(chunk) for chunk in _split_text(text, MAX_SECTION_TEXT)]
+
+
+def _mrkdwn_code(text: str, fmt) -> list[Block]:
+    return _mrkdwn_sections(fmt("```\n" + (text.rstrip("\n") or " ") + "\n```"))
+
+
+def _mrkdwn_quote(lines: list[str], fmt) -> list[Block]:
+    return _mrkdwn_sections(fmt("\n".join(f"> {ln}" for ln in lines)))
+
+
+def _mrkdwn_list(items: list[tuple[int, bool, str]], fmt) -> list[Block]:
+    """Items as ``•``/``1.`` lines, nesting shown by em-space indentation and a per-level bullet."""
+    levels: list[tuple[bool, int]] = []  # (ordered, count) per indent level
+    lines: list[str] = []
+    for indent, ordered, text in items:
+        del levels[indent + 1:]
+        levels.extend([(ordered, 0)] * (indent + 1 - len(levels)))
+        kind, count = levels[indent]
+        count = count + 1 if kind == ordered else 1
+        levels[indent] = (ordered, count)
+        marker = f"{count}." if ordered else _BULLET_MARKERS[indent % len(_BULLET_MARKERS)]
+        lines.append(f"{_MRKDWN_INDENT * indent}{marker} {fmt(text)}")
+    return _mrkdwn_sections("\n".join(lines))
+
+
+_RICH_BUILDERS = {
+    "code": lambda text, fmt: [_preformatted_block(text)],
+    "quote": lambda lines, fmt: [_quote_block(lines)],
+    "list": lambda items, fmt: [_list_block(items)],
+}
+_MRKDWN_BUILDERS = {"code": _mrkdwn_code, "quote": _mrkdwn_quote, "list": _mrkdwn_list}
+
+
+# Slack measures the budget on its mrkdwn rendering: a unicode emoji counts as its ``:shortcode:``
+# (up to ~24 chars, e.g. :vertical_traffic_light:), a link as ``<url|text>``, a list item/line +1.
+_EMOJI_CHARS = 24
+_EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2190-\u21FF\u2300-\u27BF\u2B00-\u2BFF\u3030\u303D]")
+
+
+def _text_cost(text: str) -> int:
+    return len(text) + len(_EMOJI_RE.findall(text)) * (_EMOJI_CHARS - 1)
+
+
+def estimate_text_chars(node: Any) -> int:
+    """Aggregate text Slack counts toward a message's block budget: every ``text`` string, link
+    ``url``, table cell and nested element, with emoji at shortcode length (see ``_EMOJI_CHARS``)."""
+    if isinstance(node, list):
+        return sum(estimate_text_chars(n) for n in node)
+    if not isinstance(node, dict):
+        return 0
+    btype = node.get("type")
+    text = node.get("text")
+    total = _text_cost(text) if isinstance(text, str) else estimate_text_chars(text)
+    if btype == "link":
+        total += len(node.get("url") or "") + 3
+    elif btype == "emoji":
+        total += _EMOJI_CHARS
+    elif btype in ("user", "channel", "usergroup", "broadcast"):
+        total += 12
+    elif btype in ("rich_text_section", "rich_text_list", "section", "header"):
+        total += 1
+    return total + sum(estimate_text_chars(node.get(k)) for k in ("elements", "rows", "fields"))
+
+
+def _over_rich_text_budget(blocks: list[Block]) -> bool:
+    has_rich_text = any(b.get("type") == "rich_text" for b in blocks)
+    return has_rich_text and estimate_text_chars(blocks) > MAX_RICH_TEXT_MESSAGE_CHARS
+
+
+# ----------------------------------------------------------------------------
 # Table handling — native Block Kit ``table`` block, monospace fallback
 # ----------------------------------------------------------------------------
 
@@ -410,7 +494,14 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
     if not markdown or not markdown.strip():
         return None
     fmt = mrkdwn_fn or (lambda s: s)
+    blocks = _render_markdown(markdown, fmt, _RICH_BUILDERS)
+    if blocks and _over_rich_text_budget(blocks):
+        blocks = _render_markdown(markdown, fmt, _MRKDWN_BUILDERS)
+    return blocks
 
+
+def _render_markdown(markdown: str, fmt, build: dict) -> Optional[list[Block]]:
+    """One render pass; ``build`` supplies the code/quote/list block builders."""
     try:
         blocks: list[Block] = []
         lines = markdown.replace("\r\n", "\n").split("\n")
@@ -449,7 +540,7 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
                     body.append(lines[i])
                     i += 1
                 i += 1  # consume closing fence
-                blocks.append(_preformatted_block("\n".join(body)))
+                blocks.extend(build["code"]("\n".join(body), fmt))
                 continue
 
             # Horizontal rule → divider
@@ -485,7 +576,7 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
                 if table is not None:
                     blocks.append(table)
                 else:
-                    blocks.append(_preformatted_block(_render_table(trows)))
+                    blocks.extend(build["code"](_render_table(trows), fmt))
                 continue
 
             # Blockquote group
@@ -498,7 +589,7 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
                         break
                     qlines.append(qm.group(1))
                     i += 1
-                blocks.append(_quote_block(qlines))
+                blocks.extend(build["quote"](qlines, fmt))
                 continue
 
             # List group (bullets + ordered, with nesting)
@@ -537,7 +628,7 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
                             break
                     else:
                         break
-                blocks.append(_list_block(items))
+                blocks.extend(build["list"](items, fmt))
                 continue
 
             # Default: accumulate into a paragraph
