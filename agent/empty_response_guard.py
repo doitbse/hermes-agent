@@ -176,17 +176,22 @@ def record_empty_attempt(
     finish_reason: str,
     response: Any,
     observed_generation: bool = True,
+    leaked_special_tokens: bool = False,
 ) -> None:
     """Record one empty completion in the current streak.
 
     Call BEFORE ``_empty_content_retries`` is incremented: a counter of 0 marks a new
-    streak and clears prior history."""
+    streak and clears prior history. ``leaked_special_tokens``: the only content was
+    tokenizer special tokens (``<end_of_image>``) — billed output, but deterministic
+    garbage, so it counts as zero visible output for the streak."""
     attempts = _attempts(agent)
     if getattr(agent, "_empty_content_retries", 0) == 0:
         attempts.clear()
         setattr(agent, _STREAK_COST_ATTR, Decimal(0))
 
     usage_present, zero_output = _zero_output(agent, response)
+    if leaked_special_tokens and not observed_generation:
+        usage_present, zero_output = True, True
     attempts.append(
         EmptyAttempt(
             model=str(getattr(agent, "model", "") or ""),

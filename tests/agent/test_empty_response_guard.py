@@ -375,3 +375,61 @@ class TestResolveGuardSettings:
             guard.DEFAULT_GUARD_ENABLED,
             guard.DEFAULT_COST_THRESHOLD_USD,
         )
+
+
+class TestLeakedSpecialTokens:
+    """A response whose only content is leaked tokenizer specials (Gemma ``<end_of_image>``)
+    bills output tokens but is deterministic garbage: two in a row must trip the guard."""
+
+    def test_helper_and_strip(self):
+        from agent.agent_runtime_helpers import is_leaked_special_tokens_only, strip_think_blocks
+
+        assert is_leaked_special_tokens_only("<end_of_image>")
+        assert is_leaked_special_tokens_only(" <end_of_image>\n<|im_end|> <EOS> ")
+        assert not is_leaked_special_tokens_only("")
+        assert not is_leaked_special_tokens_only(None)
+        assert not is_leaked_special_tokens_only("Done.<end_of_image>")
+        assert strip_think_blocks(None, "<end_of_image>") == ""
+        assert strip_think_blocks(None, "<think>x</think><end_of_image>") == ""
+        assert strip_think_blocks(None, "Hi <end_of_image>") == "Hi <end_of_image>"
+
+    def test_leaked_tokens_with_billed_output_is_deterministic(self):
+        agent = _agent()
+        for _ in range(2):
+            guard.record_empty_attempt(
+                agent, finish_reason="stop", response=_response(completion_tokens=3),
+                observed_generation=False, leaked_special_tokens=True,
+            )
+            agent._empty_content_retries += 1
+        assert guard.deterministic_empty(agent) is True
+
+    def test_billed_output_without_flag_keeps_budget(self):
+        agent = _agent()
+        _record_streak(agent, [_response(completion_tokens=3)] * 2)
+        assert guard.deterministic_empty(agent) is False
+
+    def test_flag_ignored_when_reasoning_observed(self):
+        agent = _agent()
+        for _ in range(2):
+            guard.record_empty_attempt(
+                agent, finish_reason="stop", response=_response(completion_tokens=3),
+                observed_generation=True, leaked_special_tokens=True,
+            )
+            agent._empty_content_retries += 1
+        assert guard.deterministic_empty(agent) is False
+
+    def test_retry_empty_switches_after_two_end_of_image_stops(self, monkeypatch):
+        from agent import turn_empty_response as ter
+
+        monkeypatch.setattr(ter, "interruptible_backoff_sleep", lambda *a, **k: None)
+        agent = _agent(_buffer_diagnostic_status=lambda *_: None)
+        resp = _response(completion_tokens=3)
+        kw = dict(messages=[], conversation_history=None, api_call_count=1,
+                  observed_generation=False, final_response="<end_of_image>")
+
+        action, _, deterministic = ter._retry_empty(agent, resp, "stop", True, **kw)
+        assert (action, deterministic) == ("continue", False)
+        action, _, deterministic = ter._retry_empty(agent, resp, "stop", True, **kw)
+        # Second identical garbage stop: no third paid retry, caller goes to fallback.
+        assert (action, deterministic) == (None, True)
+        assert agent._empty_content_retries == 1
