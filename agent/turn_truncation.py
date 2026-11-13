@@ -145,6 +145,11 @@ _WINDOW_FILLED = (
     "output-length limit.\n\nTo fix this:\n→ Compress the conversation with `/compress` or start "
     "a new session\n→ Or raise the model's context window (e.g. Ollama `num_ctx`)"
 )
+_REPEATED_STUB_FINAL = (
+    "⚠️ The model provider ended its response stream early with the same fragment on retry, "
+    "so no answer was produced. Resend your message to try again (your conversation history "
+    "is preserved)."
+)
 
 
 def _prompt_filled_window(agent: Any, response: Any) -> Optional[tuple[int, int]]:
@@ -310,6 +315,54 @@ def _content_filter_fallback(st: _Trunc, _retry: TurnRetryState) -> Optional[Tru
     return None
 
 
+def _repeated_stub_failure(st: _Trunc, _retry: TurnRetryState, content: Any) -> Optional[TruncationVerdict]:
+    """A clean-EOF stub repeating the previous stub fragment verbatim is a deterministic
+    provider failure: drop the trail (stitching would persist the duplicates), then try
+    the fallback chain, else end the turn with an explicit notice."""
+    visible = content.strip() if isinstance(content, str) else ""
+    if not (st.is_stub and getattr(st.response, "_clean_eof", False) and visible
+            and st.truncated_response_parts):
+        return None
+    prev_text, prev_is_stub = st.truncated_response_parts[-1]
+    if not (prev_is_stub and isinstance(prev_text, str) and prev_text.strip() == visible):
+        return None
+    agent = st.agent
+    idx = st.current_turn_user_idx
+    turn_start = idx + 1 if isinstance(idx, int) and idx >= 0 else 0
+    st.messages[turn_start:] = [
+        m for m in st.messages[turn_start:]
+        if not (isinstance(m, dict) and (
+            m.get("_length_continuation_fragment") or m.get("_length_continuation_nudge")
+        ))
+    ]
+    agent._session_messages = st.messages
+    st.truncated_response_parts = []
+    st.length_continue_retries = 0
+    agent._ephemeral_reasoning_off = False
+    if (
+        agent._fallback_index < len(agent._fallback_chain)
+        and agent._try_activate_fallback(reason=FailoverReason.incomplete_response)
+    ):
+        logger.warning(
+            "%sProvider repeated the same partial stream fragment (%d chars) and closed the "
+            "stream without finish_reason — switched to fallback", agent.log_prefix, len(visible),
+        )
+        agent._emit_diagnostic_status("Provider repeated the same partial response; switching to fallback...")
+        st.retry_count = 0
+        st.compression_attempts = 0
+        _retry.primary_recovery_attempted = False
+        _retry.restart_with_rebuilt_messages = True
+        return st.done("break")
+    agent._vprint(
+        f"{agent.log_prefix}⚠️  Provider repeated the same partial fragment without finish_reason — not continuing.",
+        force=True, diagnostic=True,
+    )
+    return st.end_turn(
+        _REPEATED_STUB_FINAL,
+        "Provider repeatedly closed the stream without finish_reason after the same partial fragment",
+    )
+
+
 def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -> TruncationVerdict:
     """Text truncation (no tool calls): append the fragment + a continuation nudge (up to
     4), then the ceiling exit that drops the fragment trail and keeps the stitched partial.
@@ -317,11 +370,14 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
     reject it with 400 — only the nudge."""
     from agent.conversation_loop import _get_continuation_prompt, _join_truncated_parts
 
+    _interim_content = getattr(assistant_message, "content", None)
+    repeated = _repeated_stub_failure(st, _retry, _interim_content)
+    if repeated is not None:
+        return repeated
     agent = st.agent
     messages = st.messages
     st.length_continue_retries += 1
     n = st.length_continue_retries
-    _interim_content = getattr(assistant_message, "content", None)
     if not _interim_content and not st.is_stub:
         # Thinking-only truncation: continuing with thinking ON re-burns the budget.
         agent._ephemeral_reasoning_off = True
