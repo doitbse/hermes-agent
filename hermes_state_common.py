@@ -753,6 +753,17 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     origin_session_id TEXT NOT NULL DEFAULT ''
 );
 
+-- Runtime "Always Allow" grants on a managed install (tools/approval.py). There
+-- config.yaml is declaratively owned (NixOS configFile / configMergeScript) and
+-- save_config() refuses to write, so an [a]lways answer is persisted here
+-- instead and unioned with config.yaml's command_allowlist. Deleting a row
+-- revokes the grant, live, the way removing a command_allowlist entry does on
+-- an unmanaged install. Unmanaged installs keep writing command_allowlist.
+CREATE TABLE IF NOT EXISTS command_approvals (
+    pattern_key TEXT PRIMARY KEY,
+    created_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);

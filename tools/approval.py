@@ -415,7 +415,9 @@ def _sync_permanent_from_disk(approved: set, key: str) -> None:
     """Apply hand edits to ``command_allowlist`` made since the last sync. The gateway daemon
     outlives any one session, so an entry the operator removed must stop being honoured now, not
     at restart. Only the on-disk delta is applied: approvals this process made but could not save
-    survive. The config read is cached on the file signature. Callers hold ``_lock``."""
+    survive. The config read is cached on the file signature; on a managed install the
+    ``command_approvals`` rows in state.db are part of the on-disk set (cached on the stat
+    signature of state.db and its WAL), so deleting a row revokes live. Callers hold ``_lock``."""
     try:
         on_disk = _read_permanent_allowlist()
     except Exception as e:
@@ -490,6 +492,17 @@ def _persist_choice(session_key: str, choice: str, keys: list[str]) -> None:
 # --- Config persistence for permanent allowlist ---------------------------------------------------------------------
 
 def _read_permanent_allowlist() -> set:
+    """The active profile's permanent allowlist. Unmanaged: ``command_allowlist`` from config.yaml.
+    Managed (config.yaml owned by the package manager): that list unioned with the runtime grants
+    in ``state.db``'s ``command_approvals`` table (see :func:`_read_managed_approvals`)."""
+    from hermes_cli.config import is_managed
+    config_half = _read_config_allowlist()
+    if not is_managed():
+        return config_half
+    return config_half | _read_managed_approvals()
+
+
+def _read_config_allowlist() -> set:
     """``command_allowlist`` of the active profile's config as a set (empty on malformed input)."""
     from hermes_cli.config import load_config_readonly
     config = load_config_readonly()
@@ -512,8 +525,83 @@ def _read_permanent_allowlist() -> set:
     return set(raw)
 
 
-# What ``command_allowlist`` held the last time this process synchronised with the
-# file, per profile home ("" = the unscoped launch profile). Everything in the
+# --- Managed-mode grant store (state.db ``command_approvals``) -------------------------------------------------------
+# On a managed install config.yaml is declaratively owned and save_config() refuses to write, so
+# "always" grants live in the profile's state.db instead. Reads run on every approval check, so
+# they are cached on the stat signature of state.db and its WAL (a delete from another process
+# changes one of them); a mere read never creates state.db or the table.
+
+_MANAGED_APPROVALS_DDL = (
+    "CREATE TABLE IF NOT EXISTS command_approvals (pattern_key TEXT PRIMARY KEY, created_at REAL NOT NULL)"
+)
+_managed_approvals_cache: dict[str, tuple[tuple, frozenset]] = {}
+
+
+def _managed_approvals_db_path():
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "state.db"
+
+
+def _stat_signature(path) -> tuple | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _read_managed_approvals() -> set:
+    """``pattern_key`` rows of ``command_approvals`` in the active profile's state.db, opened
+    read-only. Empty when state.db or the table does not exist yet."""
+    import sqlite3
+    path = _managed_approvals_db_path()
+    db_sig = _stat_signature(path)
+    if db_sig is None:
+        return set()
+    signature = (db_sig, _stat_signature(f"{path}-wal"))
+    cache_key = os.fspath(path)
+    cached = _managed_approvals_cache.get(cache_key)
+    if cached is not None and cached[0] == signature:
+        return set(cached[1])
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=5.0)
+    try:
+        rows = conn.execute("SELECT pattern_key FROM command_approvals").fetchall()
+    except sqlite3.OperationalError as e:
+        if "no such table" not in str(e):
+            raise
+        rows = []
+    finally:
+        conn.close()
+    result = frozenset(row[0] for row in rows if isinstance(row[0], str))
+    _managed_approvals_cache[cache_key] = (signature, result)
+    return set(result)
+
+
+def _write_managed_approvals(grants: Iterable[str]) -> None:
+    """Record *grants* in the active profile's state.db (creating it and the table if needed)."""
+    import sqlite3
+    import time
+    grants = sorted(set(grants))
+    if not grants:
+        return
+    path = _managed_approvals_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(os.fspath(path), timeout=5.0)
+    try:
+        with conn:
+            conn.execute(_MANAGED_APPROVALS_DDL)
+            now = time.time()
+            conn.executemany(
+                "INSERT OR IGNORE INTO command_approvals (pattern_key, created_at) VALUES (?, ?)",
+                [(grant, now) for grant in grants],
+            )
+    finally:
+        conn.close()
+    _managed_approvals_cache.pop(os.fspath(path), None)
+
+
+# What ``command_allowlist`` (managed: plus state.db ``command_approvals``) held the last
+# time this process synchronised with disk, per profile home ("" = the unscoped launch profile). Everything in the
 # governing permanent set beyond it is an approval THIS process made, and is the
 # only thing a save is entitled to add: the difference separates "the operator
 # granted this here" from "this was on disk when we started, and may since have
@@ -555,8 +643,16 @@ def save_permanent_allowlist(patterns: set):
     ``patterns`` may only ADD: an entry left out of it is not removed, because the
     on-disk list wins for anything this process did not approve itself. Remove
     entries by editing ``command_allowlist`` in config.yaml.
+
+    Managed install: config.yaml is never written. New grants not already in
+    ``command_allowlist`` go to state.db's ``command_approvals`` table instead
+    (delete a row there to revoke); the governing set becomes config ∪ state.db.
     """
     try:
+        from hermes_cli.config import is_managed
+        if is_managed():
+            _save_managed_allowlist(patterns)
+            return
         from hermes_cli.config import load_config, save_config
         config = load_config()
         on_disk = set(config.get("command_allowlist", []) or [])
@@ -572,6 +668,21 @@ def save_permanent_allowlist(patterns: set):
             governing.update(merged)
     except Exception as e:
         logger.warning("Could not save allowlist: %s", e)
+
+
+def _save_managed_allowlist(patterns: set) -> None:
+    """Managed-mode half of :func:`save_permanent_allowlist`: persist new grants to state.db."""
+    with _lock:
+        key = _baseline_key()
+        baseline = _permanent_baseline_by_home.get(key, set())
+        new_grants = set(patterns) - baseline
+        config_on_disk = _read_config_allowlist()
+        _write_managed_approvals(new_grants - config_on_disk)
+        merged = config_on_disk | _read_managed_approvals() | new_grants
+        _permanent_baseline_by_home[key] = set(merged)
+        governing = _permanent_set()
+        governing.clear()
+        governing.update(merged)
 
 
 # --- Bypass check (yolo / mode=off) ---------------------------------------------------------------------------------
