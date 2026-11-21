@@ -369,13 +369,20 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     return file_ops
 
 
-def clear_file_ops_cache(task_id: str | None = None):
-    """Clear file-operation state for a finished task, or all tasks."""
+def clear_file_ops_cache(task_id: str | None = None, *, preserve_task_state: bool = False):
+    """Clear file-operation state for a finished task, or all tasks.
+
+    ``preserve_task_state`` drops only the cached ShellFileOperations handle (it may point at a
+    dead sandbox) and keeps read stamps, patch-failure counts and file_state claims: those belong
+    to the session and must survive sandbox eviction between turns (#158610).
+    """
     with _file_ops_lock:
         if task_id:
             _file_ops_cache.pop(task_id, None)
         else:
             _file_ops_cache.clear()
+    if preserve_task_state:
+        return
 
     with _read_tracker_lock:
         if task_id:

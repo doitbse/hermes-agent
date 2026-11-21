@@ -148,9 +148,11 @@ class ClientLifecycleMixin:
             # File tools key their read stamps / writer claims by the per-turn task_id (cron:
             # ``cron:<job>:<uuid>``, subagents: ``subagent-N-xxxx``), which differs from session_id;
             # cleanup_vm(session_id) alone leaves a finished run looking like a live sibling (#114446).
+            # cleanup_vm preserves task_id's own file state too (it also runs per turn), so close
+            # releases it here (#158610).
             from tools.file_tools import clear_file_ops_cache
-            for owner in getattr(self, "_process_owner_task_ids", ()):
-                if owner and owner != task_id:
+            for owner in {task_id, *getattr(self, "_process_owner_task_ids", ())}:
+                if owner:
                     clear_file_ops_cache(owner)
 
         for step in (kill_processes, lambda: cleanup_vm(task_id), lambda: cleanup_browser(task_id),
