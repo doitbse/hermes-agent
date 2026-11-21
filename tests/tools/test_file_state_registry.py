@@ -264,6 +264,113 @@ class FileToolsIntegrationTests(unittest.TestCase):
             self.assertEqual(f.read(), "B wrote\n")
 
 
+class SessionFileStateAcrossTurnsTests(unittest.TestCase):
+    """Sandbox eviction between turns must not end the session's file state (#158610)."""
+
+    def setUp(self) -> None:
+        file_state.get_registry().clear()
+        clear_file_ops_cache()
+        self._tmpdir = tempfile.mkdtemp(prefix="hermes_file_state_turns_")
+
+    def tearDown(self) -> None:
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        clear_file_ops_cache()
+
+    def _turn1_write(self, task_id: str) -> str:
+        p = os.path.join(self._tmpdir, "notes.txt")
+        self.assertNotIn("error", json.loads(write_file_tool(path=p, content="turn 1\n", task_id=task_id)))
+        return p
+
+    def _assert_turn2_write_succeeds(self, p: str, task_id: str) -> None:
+        w = json.loads(write_file_tool(path=p, content="turn 2\n", task_id=task_id))
+        self.assertFalse(w.get("stale_write_blocked"), f"turn 2 write refused: {w}")
+        with open(p) as f:
+            self.assertEqual(f.read(), "turn 2\n")
+
+    def test_per_turn_cleanup_keeps_write_baseline(self):
+        from types import SimpleNamespace
+        from agent.chat_completion_helpers import cleanup_task_resources
+        from tools import file_tools_read_tracking as rt
+
+        task_id = "session-turns"
+        p = self._turn1_write(task_id)
+        rt._read_tracker.setdefault(task_id, {})
+        with patch("run_agent.cleanup_browser"):
+            cleanup_task_resources(SimpleNamespace(verbose_logging=False), task_id)
+
+        self.assertIn(task_id, rt._read_tracker)
+        self._assert_turn2_write_succeeds(p, task_id)
+
+    def test_idle_reaper_evicts_handle_but_keeps_session_state(self):
+        from tools import file_tools, terminal_tool
+        from tools import file_tools_read_tracking as rt
+        from tools.terminal_tool_lifecycle import _cleanup_inactive_envs
+
+        task_id = "session-idle"
+        p = self._turn1_write(task_id)
+        rt._read_tracker.setdefault(task_id, {})
+        file_tools._file_ops_cache[task_id] = object()
+        with terminal_tool._env_lock:
+            terminal_tool._active_environments[task_id] = object()
+            terminal_tool._last_activity[task_id] = time.time() - 10_000
+        with patch("tools.terminal_tool_lifecycle._teardown_env"):
+            _cleanup_inactive_envs(lifetime_seconds=1)
+
+        self.assertNotIn(task_id, file_tools._file_ops_cache)
+        self.assertIn(task_id, rt._read_tracker)
+        self.assertTrue(file_state.known_reads(task_id))
+        self._assert_turn2_write_succeeds(p, task_id)
+
+    def test_agent_close_releases_session_and_owner_state(self):
+        """cleanup_vm preserves task state now, so close() itself must release the
+        session's task_id as well as every per-turn owner id."""
+        from tools import file_tools_read_tracking as rt
+
+        p = os.path.join(self._tmpdir, "owned.txt")
+        for owner in ("session-close", "subagent-1-abcd"):
+            file_state.record_read(owner, p)
+            file_state.note_write(owner, p)
+            rt._read_tracker[owner] = {"dedup": {}}
+        with patch("run_agent.AIAgent.__init__", return_value=None):
+            from run_agent import AIAgent
+            agent = AIAgent.__new__(AIAgent)
+            agent.session_id = "session-close"
+            agent._process_owner_task_ids = {"subagent-1-abcd"}
+            agent._active_children = []
+            agent._active_children_lock = threading.Lock()
+            agent.client = None
+            with patch("run_agent.cleanup_browser"), \
+                 patch("tools.computer_use.tool.release_computer_use_session"):
+                agent.close()
+
+        for owner in ("session-close", "subagent-1-abcd"):
+            self.assertEqual(file_state.known_reads(owner), [])
+            self.assertNotIn(owner, rt._read_tracker)
+        self.assertIsNone(file_state.check_stale("next-session", p))
+
+
+class PersistentLocalEnvTests(unittest.TestCase):
+    """Local/SSH carry ``_persist_env``; per-turn teardown must honour it."""
+
+    def _is_persistent(self, persistent: bool) -> bool:
+        from tools.environments.local import LocalEnvironment
+        from tools.terminal_tool_lifecycle import is_persistent_env
+
+        env = LocalEnvironment(cwd=tempfile.gettempdir(), persistent=persistent)
+        try:
+            with patch("tools.terminal_tool_lifecycle.get_active_env", return_value=env):
+                return is_persistent_env("local-task")
+        finally:
+            env.cleanup()
+
+    def test_persistent_local_env_skips_per_turn_teardown(self):
+        self.assertTrue(self._is_persistent(True))
+
+    def test_non_persistent_local_env_is_torn_down(self):
+        self.assertFalse(self._is_persistent(False))
+
+
 
 
 if __name__ == "__main__":

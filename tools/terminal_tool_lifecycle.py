@@ -80,10 +80,14 @@ def _teardown_env(env: Any, task_id: str, *, force_remove: Optional[bool] = None
 
 
 def _clear_file_ops_cache(task_id: str) -> None:
-    """Invalidate the file_ops cache entry so ShellFileOperations can't reference a dead sandbox."""
+    """Invalidate the file_ops cache entry so ShellFileOperations can't reference a dead sandbox.
+
+    Read stamps and file_state survive: sandbox eviction (per-turn cleanup_vm, idle reaper) does
+    not end the session; ``AIAgent.close()`` releases them.
+    """
     try:
         from tools.file_tools import clear_file_ops_cache
-        clear_file_ops_cache(task_id)
+        clear_file_ops_cache(task_id, preserve_task_state=True)
     except ImportError:
         pass
 
@@ -267,7 +271,9 @@ def is_persistent_env(task_id: str) -> bool:
     env = get_active_env(task_id)
     if env is None:
         return False
-    return bool(getattr(env, "_session_scoped", False) or getattr(env, "_persistent", False))
+    # Local/SSH set ``_persist_env`` (BaseEnvironment) rather than ``_persistent``.
+    return bool(getattr(env, "_session_scoped", False)
+                or getattr(env, "_persistent", getattr(env, "_persist_env", False)))
 
 
 def cleanup_all_environments():
