@@ -3,14 +3,17 @@
 import pytest
 
 from plugins.platforms.slack.block_kit import (
-    _RICH_BUILDERS,
     MAX_BLOCKS,
     MAX_RICH_TEXT_MESSAGE_CHARS,
     MAX_SECTION_TEXT,
+    _header_block,
     _render_markdown,
+    blocks_fallback_text,
     estimate_text_chars,
+    render_block_batches,
     render_blocks,
     sanitize_blocks,
+    split_block_batches,
 )
 
 
@@ -281,7 +284,10 @@ class TestEmphasisWrappingOpaqueTokens:
             {"type": "link", "url": "https://e.com/2", "text": "bold", "style": {"bold": True}},
             {"type": "link", "url": "https://e.com/3", "text": "both",
              "style": {"bold": True, "italic": True}},
-            {"type": "link", "url": "https://e.com/4", "text": "_it_ x",
+            {"type": "link", "url": "https://e.com/4", "text": "it",
+             "style": {"bold": True, "italic": True}},
+            {"type": "link", "url": "https://e.com/4", "text": " ", "style": {"bold": True}},
+            {"type": "link", "url": "https://e.com/4", "text": "x",
              "style": {"bold": True, "code": True}},
         ]
         _no_literal_markup(els, marks=("**", "`", "]("))
@@ -517,13 +523,38 @@ def _long_nested_list_md(n=40):
     )
 
 
-def _section_text(blocks):
-    return "\n".join(b["text"]["text"] for b in blocks if b["type"] == "section")
+
+
+def _fmt():
+    from gateway.config import PlatformConfig
+    from plugins.platforms.slack.adapter import SlackAdapter
+
+    return SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake")).format_message
+
+
+def _assert_batches_fit(batches):
+    for batch in batches:
+        assert len(batch) <= MAX_BLOCKS
+        assert estimate_text_chars(batch) <= MAX_RICH_TEXT_MESSAGE_CHARS
+        assert sum(b["type"] == "table" for b in batch) <= 1
+
+
+def _ordered_numbers(batches, indent=0):
+    """The numbers Slack shows for ordered items at ``indent`` (each element counts from offset+1)."""
+    numbers = []
+    for batch in batches:
+        for block in batch:
+            for el in block.get("elements") or []:
+                if (el.get("type") == "rich_text_list" and el["style"] == "ordered"
+                        and el["indent"] == indent):
+                    start = el.get("offset", 0)
+                    numbers += range(start + 1, start + 1 + len(el["elements"]))
+    return numbers
 
 
 class TestRichTextMessageBudget:
     """Once any rich_text block is present Slack caps the aggregate text of the whole message
-    (msg_blocks_too_long); over budget, the renderer degrades to mrkdwn sections."""
+    (msg_blocks_too_long); over budget, the blocks are split across messages, staying native."""
 
     def test_estimate_counts_link_urls(self):
         url = "https://example.com/" + "x" * 80
@@ -537,47 +568,233 @@ class TestRichTextMessageBudget:
         section = {"type": "section", "text": {"type": "mrkdwn", "text": "🚦" * 10}}
         assert estimate_text_chars([section]) >= 240
 
-    def test_emoji_heavy_list_degrades(self):
-        md = "\n".join(f"- item {i} 🚦🏗️✅ status 🚦" for i in range(200))
-        blocks = render_blocks(md)
-        assert blocks is not None
-        assert "rich_text" not in _types(blocks)
-
-    def test_long_nested_list_degrades_to_sections(self):
-        from gateway.config import PlatformConfig
-        from plugins.platforms.slack.adapter import SlackAdapter
-
-        fmt = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake")).format_message
+    def test_long_nested_list_splits_into_native_batches_with_continuous_numbering(self):
         md = _long_nested_list_md()
-        rich = _render_markdown(md, fmt, _RICH_BUILDERS)
-        assert estimate_text_chars(rich) > MAX_RICH_TEXT_MESSAGE_CHARS  # premise
+        assert estimate_text_chars(_render_markdown(md, _fmt())) > MAX_RICH_TEXT_MESSAGE_CHARS
 
-        blocks = render_blocks(md, mrkdwn_fn=fmt)
-        assert blocks is not None
-        assert "rich_text" not in _types(blocks)
-        assert len(blocks) <= MAX_BLOCKS
-        assert all(len(b["text"]["text"]) <= MAX_SECTION_TEXT for b in blocks)
-        text = _section_text(blocks)
+        batches = render_block_batches(md, mrkdwn_fn=_fmt())
+        assert len(batches) > 1
+        _assert_batches_fit(batches)
+        assert all(b["type"] == "rich_text" for batch in batches for b in batch)
+        assert _ordered_numbers(batches) == list(range(1, 41))
+        text = str(batches)
         for i in range(1, 41):
-            assert f"{i}. *Item {i} title*" in text
-            assert f"detail two for item {i}" in text
-        assert "<https://example.com/tracker/issues/00007?view=full|ticket 7>" in text
-        assert "\u2003\u2003◦ detail one for item 7" in text
-        assert estimate_text_chars(blocks) < 2 * estimate_text_chars(rich)
+            assert f"Item {i} title" in text and f"detail two for item {i} " in text
+        # A caller that cannot split (chat.update) gets None and uses plain text.
+        assert render_blocks(md, mrkdwn_fn=_fmt()) is None
 
-    def test_short_nested_list_keeps_rich_text_list(self):
-        blocks = render_blocks(_long_nested_list_md(3))
-        rich = next(b for b in blocks if b["type"] == "rich_text")
-        assert any(e["type"] == "rich_text_list" for e in rich["elements"])
+    def test_emoji_heavy_list_stays_rich_text(self):
+        md = "\n".join(f"- item {i} 🚦🏗️✅ status 🚦" for i in range(200))
+        batches = render_block_batches(md)
+        assert len(batches) > 1
+        _assert_batches_fit(batches)
+        items = [
+            item for batch in batches for block in batch for el in block["elements"]
+            for item in el["elements"]]
+        assert len(items) == 200
+        assert all(el["style"] == "bullet" for batch in batches for block in batch
+                   for el in block["elements"])
 
-    def test_code_and_quote_render_as_sections_when_degraded(self):
+    def test_code_and_quote_stay_native_when_over_budget(self):
         md = (
             "```python\nprint('hi')\n```\n\n> quoted line\n> second\n\n"
             + _long_nested_list_md()
         )
-        blocks = render_blocks(md)
-        assert "rich_text" not in _types(blocks)
-        assert blocks[0]["text"]["text"] == "```\nprint('hi')\n```"
-        assert blocks[1]["text"]["text"] == "> quoted line\n> second"
+        first = render_block_batches(md)[0]
+        assert first[0]["elements"][0] == {
+            "type": "rich_text_preformatted", "elements": [{"type": "text", "text": "print('hi')"}]}
+        assert first[1]["elements"][0]["type"] == "rich_text_quote"
+
+    def test_short_nested_list_keeps_single_rich_text_list(self):
+        batches = render_block_batches(_long_nested_list_md(3))
+        assert len(batches) == 1
+        assert any(e["type"] == "rich_text_list" for e in batches[0][0]["elements"])
+
+    def test_oversized_code_block_splits_on_line_boundaries(self):
+        lines = [f"line {i:05d} " + "x" * 40 for i in range(600)]
+        batches = render_block_batches("```\n" + "\n".join(lines) + "\n```")
+        assert len(batches) > 1
+        _assert_batches_fit(batches)
+        texts = []
+        for batch in batches:
+            for block in batch:
+                el = block["elements"][0]
+                assert el["type"] == "rich_text_preformatted"
+                texts.append("".join(c["text"] for c in el["elements"]))
+        assert all(not t.startswith("\n") and not t.endswith("\n") for t in texts)
+        assert "\n".join(texts) == "\n".join(lines)
+
+    def test_oversized_quote_splits_on_lines_and_keeps_links(self):
+        md = "\n".join(f"> quote {i} see [ref](https://example.com/{i}) " + "y" * 60 for i in range(300))
+        batches = render_block_batches(md)
+        assert len(batches) > 1
+        _assert_batches_fit(batches)
+        quotes = [b["elements"][0] for batch in batches for b in batch]
+        assert all(q["type"] == "rich_text_quote" for q in quotes)
+        links = [c for q in quotes for c in q["elements"] if c["type"] == "link"]
+        assert [c["url"] for c in links] == [f"https://example.com/{i}" for i in range(300)]
+
+    def test_single_line_over_budget_is_cut_without_losing_text(self):
+        line = "z" * (MAX_RICH_TEXT_MESSAGE_CHARS * 2 + 10)
+        batches = render_block_batches(f"```\n{line}\n```")
+        assert len(batches) == 3
+        _assert_batches_fit(batches)
+        assert "".join(
+            b["elements"][0]["elements"][0]["text"] for batch in batches for b in batch) == line
+
+    def test_more_than_fifty_blocks_split_into_batches(self):
+        md = "\n\n".join(f"paragraph {i}" for i in range(MAX_BLOCKS + 10))
+        batches = render_block_batches(md)
+        assert [len(b) for b in batches] == [MAX_BLOCKS, 10]
+        assert render_blocks(md) is None
+
+    def test_sections_only_message_is_not_char_capped(self):
+        # Slack caps aggregate text only once rich_text is present.
+        md = "\n\n".join("w" * 2000 for _ in range(10))
+        assert len(render_block_batches(md)) == 1
+
+    def test_divider_only_content_declines(self):
+        assert render_block_batches("\n\n".join(["---"] * (MAX_BLOCKS + 10))) is None
+
+    def test_each_table_gets_its_own_message_and_keeps_its_heading(self):
+        table = "| a | b |\n|---|---|\n| {0} | x |"
+        md = f"## First\n\n{table.format(1)}\n\n## Second\n\n{table.format(2)}"
+        batches = render_block_batches(md)
+        assert [_types(b) for b in batches] == [["header", "table"], ["header", "table"]]
+        assert batches[1][0]["text"]["text"] == "Second"
+        assert render_blocks(md) is None
+
+    def test_trailing_header_moves_to_next_batch(self):
+        body = _rich_text_para("a" * 60)
+        header = _header_block("Next", level=2)
+        batches = split_block_batches([body, header, _rich_text_para("b" * 60)], max_chars=100)
+        assert [_types(b) for b in batches] == [["rich_text"], ["header", "rich_text"]]
+
+    def test_header_only_batch_is_not_emptied(self):
+        h1, h2 = _header_block("One"), _header_block("Two")
+        batches = split_block_batches([h1, h2, _rich_text_para("c" * 66)], max_chars=70)
+        assert [_types(b) for b in batches] == [["header", "header"], ["rich_text"]]
 
 
+def _rich_text_para(text):
+    return {"type": "rich_text", "elements": [
+        {"type": "rich_text_section", "elements": [{"type": "text", "text": text}]}]}
+
+
+class TestOrderedListOffsets:
+    def test_ordered_run_resumed_after_nested_list_continues_numbering(self):
+        blocks = render_blocks("1. a\n   - nested\n2. b\n3. c\n   1. sub\n4. d")
+        assert _ordered_numbers([blocks]) == [1, 2, 3, 4]
+        assert _ordered_numbers([blocks], indent=1) == [1]
+
+    def test_bullets_reset_ordered_numbering_at_same_indent(self):
+        blocks = render_blocks("1. a\n2. b\n\n- x\n\n1. c")
+        assert _ordered_numbers([blocks]) == [1, 2, 1]
+
+
+class TestHeadings:
+    @pytest.mark.parametrize("hashes, level", [("#", 1), ("##", 2), ("###", 3), ("####", 4),
+                                               ("#####", 4), ("######", 4)])
+    def test_heading_level_maps_to_header_level(self, hashes, level):
+        block = render_blocks(f"{hashes} Title")[0]
+        assert block["type"] == "header" and block["level"] == level
+
+    def test_header_block_replaces_links_with_labels(self):
+        block = _header_block("**See [Docs](https://x.com/d) and <https://y.com|Y> or <https://z.com>**")
+        assert block["text"]["text"] == "See Docs and Y or https://z.com"
+
+    def test_heading_with_link_renders_bold_rich_text_keeping_link(self):
+        blocks = render_blocks("## **Status: [tracker](https://x.com/t) _today_**")
+        assert blocks[0]["type"] == "rich_text"
+        assert blocks[0]["elements"][0]["elements"] == [
+            {"type": "text", "text": "Status: ", "style": {"bold": True}},
+            {"type": "link", "url": "https://x.com/t", "text": "tracker", "style": {"bold": True}},
+            {"type": "text", "text": " ", "style": {"bold": True}},
+            {"type": "text", "text": "today", "style": {"bold": True, "italic": True}},
+        ]
+
+
+class TestBareUrls:
+    def test_bare_url_becomes_link_without_duplicate_text(self):
+        assert _list_item("- see https://example.com/a?b=1.") == [
+            {"type": "text", "text": "see "},
+            {"type": "link", "url": "https://example.com/a?b=1"},
+            {"type": "text", "text": "."},
+        ]
+
+    @pytest.mark.parametrize("md, url, tail", [
+        ("(https://x.com/a)", "https://x.com/a", ")"),
+        ("https://en.wikipedia.org/wiki/Foo_(bar)", "https://en.wikipedia.org/wiki/Foo_(bar)", ""),
+        ("https://en.wikipedia.org/wiki/Foo_(bar)).", "https://en.wikipedia.org/wiki/Foo_(bar)", ")."),
+        ("[https://x.com/a]", "https://x.com/a", "]"),
+        ("https://x.com/a!?", "https://x.com/a", "!?"),
+    ])
+    def test_trailing_punctuation_and_unbalanced_brackets_stay_outside(self, md, url, tail):
+        els = _list_item(f"- {md}")
+        link = next(e for e in els if e["type"] == "link")
+        assert link == {"type": "link", "url": url}
+        assert els[-1] == ({"type": "text", "text": tail} if tail else link)
+
+    def test_slack_autolink_without_label_omits_text(self):
+        assert _list_item("- <https://example.com/x>") == [
+            {"type": "link", "url": "https://example.com/x"}]
+
+    def test_bold_bare_url_keeps_style(self):
+        assert _list_item("- **https://example.com/x**") == [
+            {"type": "link", "url": "https://example.com/x", "style": {"bold": True}}]
+
+    def test_url_in_code_or_markdown_link_is_not_relinked(self):
+        assert _list_item("- `https://x.com/a`") == [
+            {"type": "text", "text": "https://x.com/a", "style": {"code": True}}]
+        assert _list_item("- [https://x.com/a](https://x.com/a)") == [
+            {"type": "link", "url": "https://x.com/a"}]
+
+    def test_bare_url_counted_once_in_budget(self):
+        url = "https://example.com/" + "p" * 100
+        link = _list_item(f"- {url}")[0]
+        assert estimate_text_chars(link) == len(url) + 3
+
+    def test_quote_and_table_cell_autolink(self):
+        assert {"type": "link", "url": "https://x.com/q"} in _quote("> at https://x.com/q")
+        assert _table_cell("https://x.com/c") == [{"type": "link", "url": "https://x.com/c"}]
+
+
+class TestLinkLabelPartialEmphasis:
+    def test_partially_bold_label_splits_into_styled_links(self):
+        assert _list_item("- [**Open Opps** sheet](https://example.com/s)") == [
+            {"type": "link", "url": "https://example.com/s", "text": "Open Opps",
+             "style": {"bold": True}},
+            {"type": "link", "url": "https://example.com/s", "text": " sheet"},
+        ]
+
+    def test_label_mixing_code_and_italic_under_outer_strike(self):
+        els = _list_item("- ~~[run `make` _now_](https://e.com/r)~~")
+        assert els == [
+            {"type": "link", "url": "https://e.com/r", "text": "run ", "style": {"strike": True}},
+            {"type": "link", "url": "https://e.com/r", "text": "make",
+             "style": {"strike": True, "code": True}},
+            {"type": "link", "url": "https://e.com/r", "text": " ", "style": {"strike": True}},
+            {"type": "link", "url": "https://e.com/r", "text": "now",
+             "style": {"strike": True, "italic": True}},
+        ]
+        _no_literal_markup(els)
+
+
+class TestBatchFallbackText:
+    def test_fallback_text_covers_every_block_kind(self):
+        md = (
+            "# Plan\n\nIntro para\n\n- see [docs](https://x.com/d) for <@U1>\n- a < b\n\n"
+            "3. third\n4. **fourth**\n\n> quoted\n\n```\ncode <x>\n```\n\n"
+            "| k | v |\n|---|---|\n| one | two |"
+        )
+        text = blocks_fallback_text(render_blocks(md))
+        assert text.splitlines() == [
+            "*Plan*", "Intro para", "• see <https://x.com/d|docs> for <@U1>", "• a &lt; b",
+            "1. third", "2. *fourth*", "> quoted", "```", "code &lt;x&gt;", "```",
+            "k | v", "one | two",
+        ]
+
+    def test_fallback_numbers_continue_after_split(self):
+        batches = render_block_batches(_long_nested_list_md())
+        numbered = [ln for ln in blocks_fallback_text(batches[1]).splitlines() if ln[0].isdigit()]
+        assert int(numbered[0].split(".", 1)[0]) == _ordered_numbers(batches[1:])[0] > 1

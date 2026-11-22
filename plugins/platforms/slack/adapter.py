@@ -61,14 +61,14 @@ from gateway.platforms.base import (
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 
 try:  # sibling modules; support both package and flat plugin-dir import
-    from .block_kit import render_blocks, sanitize_blocks
+    from .block_kit import heading_marks, link_mrkdwn, plan_messages, render_block_batches, sanitize_blocks
     from .adapter_slash_lane import SlashHandoffLanes
     from .adapter_slash_payload import slash_command_text, slash_thread_id
     from .adapter_reactions_context import slack_reactions_marker
     from .adapter_socket_lifecycle import SlackSocketLifecycleMixin
     from .adapter_image_batch import collect_image_uploads
 except ImportError:  # pragma: no cover - plugin loaded outside package context
-    from block_kit import render_blocks, sanitize_blocks  # type: ignore
+    from block_kit import heading_marks, link_mrkdwn, plan_messages, render_block_batches, sanitize_blocks  # type: ignore
     from adapter_slash_lane import SlashHandoffLanes  # type: ignore
     from adapter_slash_payload import slash_command_text, slash_thread_id  # type: ignore
     from adapter_reactions_context import slack_reactions_marker  # type: ignore
@@ -529,6 +529,8 @@ def _extract_text_from_slack_blocks(blocks: list) -> str:
             elem_type = elem.get("type", "")
             if elem_type == "rich_text_section":
                 _append_line(_render_inline_elements(elem.get("elements", [])), quote_depth, bullet)
+            elif elem_type == "rich_text_header":
+                _append_line(f"{heading_marks(elem)} {_render_inline_elements(elem.get('elements', []))}", quote_depth, bullet)
             elif elem_type == "rich_text_quote":
                 _walk_elements(elem.get("elements", []), quote_depth=quote_depth + 1)
             elif elem_type == "rich_text_list":
@@ -554,6 +556,8 @@ def _extract_text_from_slack_blocks(blocks: list) -> str:
         block_type = (block or {}).get("type")
         if block_type == "rich_text":
             _walk_elements(block.get("elements", []))
+        elif block_type == "header" and (header := _slack_str_field(block.get("text") or {}, "text")).strip():
+            parts.append(f"{heading_marks(block)} {header}")
         elif block_type == "table":
             table_text = _render_slack_table_block(block)
             if table_text:
@@ -749,7 +753,7 @@ def _extract_additional_text_from_slack_blocks(
 
 # Block Kit keys kept in the agent-facing payload dump (scalars copied; containers recursed).
 _BLOCK_SCALAR_KEYS = frozenset(
-    "type block_id action_id style dispatch_action optional multiple emoji".split())
+    "type block_id action_id style dispatch_action optional multiple emoji level".split())
 _BLOCK_RECURSIVE_KEYS = frozenset(
     "text title description label placeholder accessory fields elements options "
     "option_groups confirm submit close hint".split())
@@ -2258,17 +2262,17 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
     ) -> Any:
         """``chat.postMessage`` each ``MAX_MESSAGE_LENGTH`` chunk; returns the last response.
         Block Kit only for single-chunk messages (a >39k response is pathological for the 50-block /
-        3000-char limits); ``text`` stays the notification/accessibility fallback. With
-        ``reply_broadcast`` only the first chunk is also posted to the main channel."""
+        3000-char limits); ``text`` stays the notification fallback. Oversized blocks
+        post as consecutive messages; ``reply_broadcast`` applies to the first only."""
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         broadcast = self.config.extra.get("reply_broadcast", False)
-        blocks = self._maybe_blocks(content) if len(chunks) == 1 else None
+        messages = plan_messages(chunks, self._block_batches(content) if len(chunks) == 1 else None)
         last_result = None
-        for i, chunk in enumerate(chunks):
+        for i, (chunk, blocks) in enumerate(messages):
             kwargs = {
                 "channel": chat_id, "text": chunk,
                 "mrkdwn": True, **_slack_unfurl_kwargs(self.config.extra)}
-            if blocks and i == 0:
+            if blocks:
                 kwargs["blocks"] = blocks
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
@@ -3076,25 +3080,21 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
         return blocks
 
     def _maybe_blocks(self, content: str) -> Optional[list]:
-        """Block Kit for ``content``: ``markdown_blocks`` (native block, "platform AI" apps only,
-        12k cap) over ``rich_blocks`` (local renderer). ``None`` when disabled or declined — a
-        ``text`` fallback always accompanies blocks, so ``None`` is safe at any point.
+        """Blocks as ONE message (``chat.update`` cannot split); ``None`` if declined/multi-message."""
+        batches = self._block_batches(content) or []
+        return batches[0] if len(batches) == 1 else None
 
-        1. ``markdown_blocks`` — Slack's native ``markdown`` block renders the *raw* standard markdown
-        (tables, headers, code fences with syntax highlighting) with Slack doing the translation (#8552). 2.
-        """
+    def _block_batches(self, content: str) -> Optional[list[list]]:
+        """Block Kit per message (feedback buttons on the last): native ``markdown_blocks`` (#8552,
+        "platform AI" apps, 12k cap) over ``rich_blocks`` (local renderer, split by message limits)."""
         if self._extra_flag("markdown_blocks"):
-            md_blocks = self._markdown_block_payload(content)
-            if md_blocks:
-                return sanitize_blocks(self._append_feedback_block(md_blocks))
+            if md_blocks := sanitize_blocks(self._append_feedback_block(self._markdown_block_payload(content))):
+                return [md_blocks]
         if not self._extra_flag("rich_blocks"):
             return None
-        try:
-            blocks = render_blocks(content, mrkdwn_fn=self.format_message)
-            return sanitize_blocks(self._append_feedback_block(blocks))
-        except Exception:  # pragma: no cover - renderer already guards itself
-            logger.debug("[Slack] block render failed; using plain text", exc_info=True)
-            return None
+        batches = render_block_batches(content, mrkdwn_fn=self.format_message) or []
+        batches[-1:] = [self._append_feedback_block(last) for last in batches[-1:]]
+        return [b for b in map(sanitize_blocks, batches) if b] or None
 
     def format_tool_preview(self, preview) -> str:
         """Keep compact tool arguments out of mrkdwn emphasis conversion."""
@@ -3133,7 +3133,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
             url = m.group(2).strip()
             if url.startswith("<") and url.endswith(">"):
                 url = url[1:-1].strip()
-            return _ph(f"<{url}|{m.group(1)}>")
+            return _ph(link_mrkdwn(url, m.group(1)))
 
         def _convert_header(m):
             inner = re.sub(r"\*\*(.+?)\*\*", r"\1", m.group(1).strip())
