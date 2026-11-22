@@ -213,3 +213,110 @@ class TestMarkdownBlockMode:
         assert kwargs["blocks"][0]["text"] == RICH_TABLE_MD
 
 
+
+
+# ---------------------------------------------------------------------------
+# rich_blocks over one message's limits — consecutive native Block Kit messages
+# ---------------------------------------------------------------------------
+
+
+def _long_ordered_list_md(n=40):
+    return "\n".join(
+        f"{i}. **Item {i}** see [ticket {i}](https://example.com/tracker/issues/{i:05d}?view=full)"
+        f" and the long explanatory description of what changed and why it matters {'z' * 200}"
+        for i in range(1, n + 1))
+
+
+class TestMultiMessageBlocks:
+    @pytest.mark.asyncio
+    async def test_over_budget_reply_posts_each_batch_natively(self):
+        from plugins.platforms.slack.block_kit import MAX_RICH_TEXT_MESSAGE_CHARS, estimate_text_chars
+
+        adapter, client = _make_adapter(
+            {"rich_blocks": True, "feedback_buttons": True, "reply_broadcast": True})
+        result = await adapter.send("C1", _long_ordered_list_md(), metadata={"thread_id": "9.9"})
+
+        assert result.success is True
+        calls = [c.kwargs for c in client.chat_postMessage.await_args_list]
+        assert len(calls) > 1
+        for kwargs in calls:
+            content = [b for b in kwargs["blocks"] if b["type"] != "context_actions"]
+            assert all(b["type"] == "rich_text" for b in content)
+            assert estimate_text_chars(content) <= MAX_RICH_TEXT_MESSAGE_CHARS
+            assert kwargs["thread_ts"] == "9.9"
+        # Each message's text fallback carries only its own batch.
+        assert "Item 1*" in calls[0]["text"] and "Item 40*" not in calls[0]["text"]
+        assert "Item 40*" in calls[-1]["text"]
+        assert [c.get("reply_broadcast", False) for c in calls] == [True] + [False] * (len(calls) - 1)
+        assert [c["blocks"][-1]["type"] == "context_actions" for c in calls] == (
+            [False] * (len(calls) - 1) + [True])
+
+    @pytest.mark.asyncio
+    async def test_two_tables_post_as_two_native_messages(self):
+        adapter, client = _make_adapter({"rich_blocks": True})
+        await adapter.send("C1", f"{RICH_TABLE_MD}\n\nbetween\n\n{RICH_TABLE_MD}")
+        calls = [c.kwargs for c in client.chat_postMessage.await_args_list]
+        assert [[b["type"] for b in c["blocks"]] for c in calls] == [
+            ["table", "section"], ["table"]]
+        assert all("Hermes | ok | table" in c["text"] for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_rejected_batch_retries_with_its_own_text(self):
+        adapter, client = _make_adapter({"rich_blocks": True})
+        client.chat_postMessage = AsyncMock(side_effect=[
+            {"ts": "1"}, SlackRejectedBlocks("invalid_blocks"), {"ts": "2"}])
+        await adapter.send("C1", f"{RICH_TABLE_MD}\n\n{RICH_TABLE_MD.replace('Hermes', 'Second')}")
+        calls = [c.kwargs for c in client.chat_postMessage.await_args_list]
+        assert len(calls) == 3
+        assert "blocks" not in calls[2]
+        assert "Second" in calls[2]["text"] and "Hermes" not in calls[2]["text"]
+
+    @pytest.mark.asyncio
+    async def test_finalize_edit_over_one_message_keeps_plain_text(self):
+        # chat.update cannot split a message, so a multi-message layout is declined.
+        adapter, client = _make_adapter({"rich_blocks": True})
+        await adapter.edit_message("C1", "111.222", _long_ordered_list_md(), finalize=True)
+        kwargs = client.chat_update.await_args.kwargs
+        assert "blocks" not in kwargs
+        assert kwargs["text"]
+
+
+class TestFormatMessageBoldLinkLabel:
+    @pytest.mark.parametrize("label, clean", [
+        ("**Open Opps** sheet", "Open Opps sheet"), ("__All__", "All"), ("**a** and **b**", "a and b")])
+    def test_emphasis_in_label_bolds_whole_link(self, label, clean):
+        adapter, _ = _make_adapter()
+        assert adapter.format_message(f"see [{label}](https://example.com/s)") == (
+            f"see *<https://example.com/s|{clean}>​*")
+
+    def test_plain_label_unchanged(self):
+        adapter, _ = _make_adapter()
+        assert adapter.format_message("[docs](https://example.com)") == "<https://example.com|docs>"
+
+
+class TestInboundHeaders:
+    def test_header_block_and_rich_text_header_render_as_markdown_headings(self):
+        from plugins.platforms.slack.adapter import _extract_text_from_slack_blocks
+
+        blocks = [
+            {"type": "header", "level": 2, "text": {"type": "plain_text", "text": "Plan"}},
+            {"type": "header", "text": {"type": "plain_text", "text": "Default"}},
+            {"type": "rich_text", "elements": [
+                {"type": "rich_text_header", "level": 3,
+                 "elements": [{"type": "text", "text": "Step one"}]},
+                {"type": "rich_text_section", "elements": [{"type": "text", "text": "body"}]},
+            ]},
+            {"type": "header", "level": 9, "text": {"type": "plain_text", "text": "Deep"}},
+        ]
+        assert _extract_text_from_slack_blocks(blocks).splitlines() == [
+            "## Plan", "# Default", "### Step one", "body", "###### Deep"]
+
+    def test_serialized_header_keeps_level(self):
+        import json
+
+        from plugins.platforms.slack.adapter import _serialize_slack_blocks_for_agent
+
+        dumped = _serialize_slack_blocks_for_agent(
+            [{"type": "header", "level": 2, "text": {"type": "plain_text", "text": "Plan"}}])
+        assert '"level": 2' in dumped
+        assert json.loads(dumped[dumped.index("\n[") + 1:dumped.rindex("]") + 1])[0]["level"] == 2

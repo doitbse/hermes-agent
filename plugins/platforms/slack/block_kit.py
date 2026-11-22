@@ -12,11 +12,13 @@ Design constraints (why this module is deliberately conservative):
   A table that exceeds Slack's limits (100 rows / 20 cols / 10k aggregate
   cell chars) or won't parse falls back to aligned monospace
   ``rich_text_preformatted`` so a large table never breaks the message.
-* **Slack caps a message at 50 blocks** and a ``section``/text object at 3000
-  characters.  :func:`render_blocks` enforces both and, if the content simply
-  cannot be expressed within them, returns ``None`` so the caller falls back
-  to the plain-text path.  A rich render is a nice-to-have; it must never lose
-  a message.
+* **Slack caps a message at 50 blocks**, a ``section``/text object at 3000
+  characters, the aggregate text of a ``rich_text``-bearing message at ~12k and
+  renders one ``table`` per message.  :func:`render_block_batches` packs the
+  blocks into as many messages as those limits need; :func:`render_blocks`
+  (for callers that cannot split, e.g. ``chat.update``) returns ``None`` when
+  one message is not enough, so the caller falls back to the plain-text path.
+  A rich render is a nice-to-have; it must never lose a message.
 * **Every blocks payload MUST ship a ``text`` fallback.**  Slack uses it for
   notifications, screen readers, and old clients.  This module only builds the
   ``blocks`` list; the adapter pairs it with the existing mrkdwn string.
@@ -28,6 +30,7 @@ adapter state — so it is trivially unit-testable.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,7 +44,7 @@ MAX_TABLE_COLS = 20
 MAX_TABLE_CHARS = 10000  # aggregate across all cells
 # Once any rich_text block is present, Slack rejects the message (msg_blocks_too_long) when the
 # aggregate text of ALL blocks, link URLs included, exceeds ~13.2k chars; sections alone are not
-# capped this way. Over budget, lists/quotes/code re-render as mrkdwn sections instead.
+# capped this way. Over budget, the blocks are split across several messages.
 MAX_RICH_TEXT_MESSAGE_CHARS = 12000
 
 Block = dict[str, Any]
@@ -105,6 +108,10 @@ _EMPHASIS = ((_BOLD_RE, "bold"), (_STRIKE_RE, "strike"), (_ITALIC_RE, "italic"))
 # NUL in the input is shielded too so it can never forge a placeholder.
 _CODE_OR_NUL_RE = re.compile(_INLINE_CODE_RE.pattern + r"|\x00")
 _PLACEHOLDER_RE = re.compile(r"\x00(\d+)\x00")
+# rich_text does not autolink, so a bare URL would render as dead text.
+_BARE_URL_RE = re.compile(r"https?://[^\s<>]+")
+# Sentence punctuation (and a closing emphasis delimiter) after a URL is not part of it.
+_URL_TRAILING_PUNCT = ".,;:!?*~"
 
 
 def _mention_element(body: str) -> Optional[dict[str, Any]]:
@@ -142,13 +149,33 @@ def _shield_tokens(text: str) -> Tuple[str, list[_Token]]:
         # A URL that swallowed a placeholder overlapped a code span: not a link.
         return raw if "\x00" in url else put(("link", raw, url, label))
 
+    def bare_url(m: re.Match) -> str:
+        url, suffix = _trim_url(m.group(0))
+        return link(url, url, url) + suffix
+
     s = _CODE_OR_NUL_RE.sub(
         lambda m: put(("code", m.group(0), m.group(1)) if m.group(1) else ("text", m.group(0))),
         text)
     s = _LINK_RE.sub(lambda m: link(m.group(2), m.group(1), m.group(0)), s)
     s = _SLACK_LINK_RE.sub(lambda m: link(m.group(1), m.group(2) or m.group(1), m.group(0)), s)
+    s = _BARE_URL_RE.sub(bare_url, s)
     s = _SLACK_MENTION_RE.sub(lambda m: put(("mention", m.group(0), m.group(1))), s)
     return s, tokens
+
+
+def _trim_url(url: str) -> Tuple[str, str]:
+    """``(url, suffix)``: trailing punctuation and unbalanced closing brackets split off, so
+    ``(see https://x.com/a).`` links ``https://x.com/a`` but ``.../Foo_(bar)`` keeps its paren."""
+    end = len(url)
+    while end:
+        ch = url[end - 1]
+        unbalanced = {")": "(", "]": "["}.get(ch)
+        if ch in _URL_TRAILING_PUNCT or (
+                unbalanced and url.count(ch, 0, end) > url.count(unbalanced, 0, end)):
+            end -= 1
+        else:
+            break
+    return url[:end], url[end:]
 
 
 def _full_emphasis(s: str) -> Optional[Tuple[str, str]]:
@@ -160,22 +187,28 @@ def _full_emphasis(s: str) -> Optional[Tuple[str, str]]:
     return None
 
 
-def _link_label(label: str, tokens: list[_Token]) -> Tuple[str, dict[str, bool]]:
-    """Plain label text + style for a link element (which takes one ``text`` and one ``style``).
-    Wrapping emphasis runs and any code span inside the label become style flags."""
-    style: dict[str, bool] = {}
+def _link_elements(tokens: list[_Token], url: str, label: str,
+                   style: dict[str, bool]) -> list[dict[str, Any]]:
+    """Link element(s) for ``label``. A link takes one ``text`` and one ``style``, so a label with
+    partial emphasis or code (``[**Open Opps** sheet](url)``) becomes one link per styled run.
+    ``text`` is omitted when it repeats ``url``: Slack shows the URL anyway, and the budget
+    (``estimate_text_chars``) would count it twice."""
+    style = dict(style)
     while (wrapped := _full_emphasis(label)) is not None and wrapped[0] not in style:
         style[wrapped[0]] = True
         label = wrapped[1]
-
-    def unshield(m: re.Match) -> str:
-        tok = tokens[int(m.group(1))]
-        if tok[0] == "code":
-            style["code"] = True
-            return tok[2]
-        return _PLACEHOLDER_RE.sub(unshield, tok[1])  # a nested link's raw may hold code
-
-    return _PLACEHOLDER_RE.sub(unshield, label), style
+    runs: list[dict[str, Any]] = []
+    _walk_emphasis(runs, tokens, label, style)
+    links = []
+    for run in runs:
+        # A label mostly holds code placeholders, but ``<u|[x](v)>`` nests a link: keep its
+        # visible text (a mention has none and is dropped).
+        text = run.get("text") or run.get("url") or ""
+        if text:
+            links.append({
+                "type": "link", "url": url, **({"text": text} if text != url else {}),
+                **({"style": run["style"]} if run.get("style") else {})})
+    return links or [{"type": "link", "url": url, **({"style": style} if style else {})}]
 
 
 def _emit_text(elements: list[dict[str, Any]], s: str, style: dict[str, bool]) -> None:
@@ -189,10 +222,7 @@ def _emit_token(elements: list[dict[str, Any]], tokens: list[_Token], tok: _Toke
     if kind == "code":
         _emit_text(elements, tok[2], {**style, "code": True})
     elif kind == "link":
-        text, label_style = _link_label(tok[3], tokens)
-        merged = {**style, **label_style}
-        elements.append({
-            "type": "link", "url": tok[2], "text": text, **({"style": merged} if merged else {})})
+        elements.extend(_link_elements(tokens, tok[2], tok[3], style))
     elif kind == "mention" and (mention := _mention_element(tok[2])) is not None:
         # Slack rejects ``style`` on user/channel/usergroup/broadcast elements.
         elements.append(mention)
@@ -249,9 +279,11 @@ def _nonempty_elements(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return els or [{"type": "text", "text": " "}]
 
 
-def _header_block(text: str) -> Optional[Block]:
-    # header blocks are plain_text only, 150 char cap.
-    clean = re.sub(r"[*_~`]", "", text).strip()
+def _header_block(text: str, level: int = 1) -> Optional[Block]:
+    # header blocks are plain_text only, 150 char cap; links keep their label.
+    clean = _LINK_RE.sub(r"\1", text)
+    clean = _SLACK_LINK_RE.sub(lambda m: m.group(2) or m.group(1), clean)
+    clean = re.sub(r"[*_~`]", "", clean).strip()
     if not clean:
         # Emphasis-/whitespace-only header (e.g. "# ***" or "#   ") reduces to
         # empty; Slack rejects an empty plain_text with invalid_blocks. Skip it
@@ -259,7 +291,19 @@ def _header_block(text: str) -> Optional[Block]:
         return None
     if len(clean) > MAX_HEADER_TEXT:
         clean = clean[: MAX_HEADER_TEXT - 1] + "…"
-    return {"type": "header", "text": {"type": "plain_text", "text": clean, "emoji": True}}
+    # Slack's header block takes level 1-4 (its own markdown block maps #..##### onto them).
+    return {
+        "type": "header", "level": min(max(int(level), 1), 4),
+        "text": {"type": "plain_text", "text": clean, "emoji": True}}
+
+
+def _heading_block(text: str, level: int) -> Optional[Block]:
+    """A markdown ATX heading. A header block is plain_text, so a heading carrying a link
+    renders as a bold rich_text line instead, keeping the link clickable."""
+    if not (_LINK_RE.search(text) or _SLACK_LINK_RE.search(text)):
+        return _header_block(text, level=level)
+    inner = text[2:-2] if len(text) > 4 and text.startswith("**") and text.endswith("**") else text
+    return _rich_text_block("rich_text_section", _inline_elements(f"**{inner}**"))
 
 
 def _divider_block() -> Block:
@@ -290,18 +334,28 @@ def _list_block(items: list[tuple[int, bool, str]]) -> Block:
     """Build ONE rich_text block from consecutive list items.
     ``items`` is a list of ``(indent, ordered, text)``. Each contiguous run sharing the same
     (indent, ordered) becomes a ``rich_text_list`` element; indentation changes start a new element,
-    which is how Slack renders true nesting."""
+    which is how Slack renders true nesting. Slack numbers each element from 1, so an ordered
+    run resumed after a nested one carries ``offset`` (items already numbered at its indent)."""
     elements: list[dict[str, Any]] = []
     cur: Optional[dict[str, Any]] = None
     cur_key: Optional[tuple[int, bool]] = None
+    numbered: dict[int, int] = {}  # ordered items so far per indent, in the current parent
     for indent, ordered, text in items:
         key = (indent, ordered)
         if key != cur_key:
+            for deeper in [d for d in numbered if d > indent]:
+                del numbered[deeper]
+            if not ordered:
+                numbered.pop(indent, None)
             cur = {
                 "type": "rich_text_list", "style": "ordered" if ordered else "bullet",
                 "indent": indent, "elements": []}
+            if numbered.get(indent):
+                cur["offset"] = numbered[indent]
             elements.append(cur)
             cur_key = key
+        if ordered:
+            numbered[indent] = numbered.get(indent, 0) + 1
         cur["elements"].append(
             {"type": "rich_text_section", "elements": _nonempty_elements(_inline_elements(text))})
     return {"type": "rich_text", "elements": elements}
@@ -309,50 +363,6 @@ def _list_block(items: list[tuple[int, bool, str]]) -> Block:
 
 def _section_block(text: str) -> Block:
     return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
-
-
-# ----------------------------------------------------------------------------
-# mrkdwn-section builders — used when rich_text would exceed the message budget
-# ----------------------------------------------------------------------------
-
-_BULLET_MARKERS = ("•", "◦", "▪")
-# Slack collapses leading ASCII spaces in mrkdwn; em spaces survive.
-_MRKDWN_INDENT = "\u2003\u2003"
-
-
-def _mrkdwn_sections(text: str) -> list[Block]:
-    return [_section_block(chunk) for chunk in _split_text(text, MAX_SECTION_TEXT)]
-
-
-def _mrkdwn_code(text: str, fmt) -> list[Block]:
-    return _mrkdwn_sections(fmt("```\n" + (text.rstrip("\n") or " ") + "\n```"))
-
-
-def _mrkdwn_quote(lines: list[str], fmt) -> list[Block]:
-    return _mrkdwn_sections(fmt("\n".join(f"> {ln}" for ln in lines)))
-
-
-def _mrkdwn_list(items: list[tuple[int, bool, str]], fmt) -> list[Block]:
-    """Items as ``•``/``1.`` lines, nesting shown by em-space indentation and a per-level bullet."""
-    levels: list[tuple[bool, int]] = []  # (ordered, count) per indent level
-    lines: list[str] = []
-    for indent, ordered, text in items:
-        del levels[indent + 1:]
-        levels.extend([(ordered, 0)] * (indent + 1 - len(levels)))
-        kind, count = levels[indent]
-        count = count + 1 if kind == ordered else 1
-        levels[indent] = (ordered, count)
-        marker = f"{count}." if ordered else _BULLET_MARKERS[indent % len(_BULLET_MARKERS)]
-        lines.append(f"{_MRKDWN_INDENT * indent}{marker} {fmt(text)}")
-    return _mrkdwn_sections("\n".join(lines))
-
-
-_RICH_BUILDERS = {
-    "code": lambda text, fmt: [_preformatted_block(text)],
-    "quote": lambda lines, fmt: [_quote_block(lines)],
-    "list": lambda items, fmt: [_list_block(items)],
-}
-_MRKDWN_BUILDERS = {"code": _mrkdwn_code, "quote": _mrkdwn_quote, "list": _mrkdwn_list}
 
 
 # Slack measures the budget on its mrkdwn rendering: a unicode emoji counts as its ``:shortcode:``
@@ -384,11 +394,6 @@ def estimate_text_chars(node: Any) -> int:
     elif btype in ("rich_text_section", "rich_text_list", "section", "header"):
         total += 1
     return total + sum(estimate_text_chars(node.get(k)) for k in ("elements", "rows", "fields"))
-
-
-def _over_rich_text_budget(blocks: list[Block]) -> bool:
-    has_rich_text = any(b.get("type") == "rich_text" for b in blocks)
-    return has_rich_text and estimate_text_chars(blocks) > MAX_RICH_TEXT_MESSAGE_CHARS
 
 
 # ----------------------------------------------------------------------------
@@ -480,7 +485,19 @@ def _render_table(rows: list[str]) -> str:
 
 
 def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
-    """Convert agent markdown to a Slack Block Kit ``blocks`` list.
+    """Convert agent markdown to ONE Slack message's ``blocks`` list.
+    For callers that cannot split a message (``chat.update``): returns ``None`` when the content
+    is empty, needs more than one message (see :func:`render_block_batches`), or hits an
+    unexpected shape — the caller then falls back to the flat ``text`` payload.  Never raises."""
+    batches = render_block_batches(markdown, mrkdwn_fn)
+    return batches[0] if batches and len(batches) == 1 else None
+
+
+def render_block_batches(
+    markdown: str, mrkdwn_fn=None, max_chars: int = MAX_RICH_TEXT_MESSAGE_CHARS,
+    max_blocks: int = MAX_BLOCKS,
+) -> Optional[list[list[Block]]]:
+    """Convert agent markdown to Block Kit ``blocks``, one list per Slack message.
     Args:
         markdown: The agent's response text (standard markdown).
         mrkdwn_fn: Optional callable converting a markdown paragraph to Slack
@@ -488,20 +505,251 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
             ``format_message``).  When ``None``, the raw paragraph text is used.
 
     Returns:
-        A list of Block Kit block dicts, or ``None`` when the content is empty,
-        exceeds Slack's structural limits, or hits an unexpected shape — the
-        caller then falls back to the flat ``text`` payload.  Never raises."""
+        Batches that each fit one message (see :func:`split_block_batches`), or ``None`` when the
+        content is empty or hits an unexpected shape.  Never raises."""
     if not markdown or not markdown.strip():
         return None
-    fmt = mrkdwn_fn or (lambda s: s)
-    blocks = _render_markdown(markdown, fmt, _RICH_BUILDERS)
-    if blocks and _over_rich_text_budget(blocks):
-        blocks = _render_markdown(markdown, fmt, _MRKDWN_BUILDERS)
-    return blocks
+    try:
+        blocks = _render_markdown(markdown, mrkdwn_fn or (lambda s: s))
+        return (split_block_batches(blocks, max_chars, max_blocks) or None) if blocks else None
+    except Exception:
+        # Never let a rendering bug drop a message.
+        logging.getLogger(__name__).debug("block render failed; using plain text", exc_info=True)
+        return None
 
 
-def _render_markdown(markdown: str, fmt, build: dict) -> Optional[list[Block]]:
-    """One render pass; ``build`` supplies the code/quote/list block builders."""
+# ----------------------------------------------------------------------------
+# Message batching — Slack's per-message limits
+# ----------------------------------------------------------------------------
+
+
+def _budgeted(block: Block) -> bool:
+    """True for blocks that put a message under the aggregate-text cap (table cells are
+    rich_text too); a message of only sections/headers/dividers is not capped this way."""
+    return block.get("type") in ("rich_text", "table")
+
+
+def _batch_fits(batch: list[Block], max_chars: int, max_blocks: int) -> bool:
+    """One message: <= ``max_blocks``, one table (Slack renders only one per message), and the
+    aggregate-text budget once any rich_text is present."""
+    if len(batch) > max_blocks or sum(b.get("type") == "table" for b in batch) > 1:
+        return False
+    return not any(_budgeted(b) for b in batch) or estimate_text_chars(batch) <= max_chars
+
+
+def split_block_batches(
+    blocks: list[Block], max_chars: int = MAX_RICH_TEXT_MESSAGE_CHARS,
+    max_blocks: int = MAX_BLOCKS,
+) -> list[list[Block]]:
+    """Pack ``blocks`` in order into per-message batches that each satisfy :func:`_batch_fits`.
+    A rich_text block over ``max_chars`` on its own is split first (list items, then lines).
+    Trailing headers move to the next batch so a heading stays with its body, and a batch of only
+    dividers is dropped."""
+    batches: list[list[Block]] = []
+    cur: list[Block] = []
+    for block in (piece for b in blocks for piece in _split_oversized(b, max_chars)):
+        if cur and not _batch_fits([*cur, block], max_chars, max_blocks):
+            carry = _trailing_headers(cur)
+            if not (carry and len(carry) < len(cur)
+                    and _batch_fits([*carry, block], max_chars, max_blocks)):
+                carry = []
+            batches.append(cur[: len(cur) - len(carry)])
+            cur = carry
+        cur.append(block)
+    if cur:
+        batches.append(cur)
+    return [b for b in batches if any(x.get("type") != "divider" for x in b)]
+
+
+def _trailing_headers(batch: list[Block]) -> list[Block]:
+    n = 0
+    while n < len(batch) and batch[-1 - n].get("type") == "header":
+        n += 1
+    return batch[len(batch) - n:]
+
+
+def _pack(units: list[Any], limit: int) -> list[list[Any]]:
+    """Greedy in-order grouping of ``units`` so each group's ``estimate_text_chars`` is <= ``limit``
+    (a single unit over ``limit`` gets a group of its own)."""
+    groups: list[list[Any]] = []
+    cur: list[Any] = []
+    cost = 0
+    for unit in units:
+        c = estimate_text_chars(unit)
+        if cur and cost + c > limit:
+            groups.append(cur)
+            cur, cost = [], 0
+        cur.append(unit)
+        cost += c
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def _split_oversized(block: Block, max_chars: int) -> list[Block]:
+    """``block`` as one or more rich_text blocks each within ``max_chars``. Lists split between
+    items (an ordered continuation carries ``offset`` so numbering continues); quotes, code and
+    sections split on line boundaries. Other block types are returned as is."""
+    if block.get("type") != "rich_text" or estimate_text_chars(block) <= max_chars:
+        return [block]
+    units: list[Tuple[int, dict[str, Any]]] = []  # (id of source list element, element)
+    for el in block.get("elements") or []:
+        if el.get("type") == "rich_text_list":
+            for idx, item in enumerate(el.get("elements") or []):
+                piece = {**el, "elements": [item]}
+                if idx and el.get("style") == "ordered":
+                    piece["offset"] = (el.get("offset") or 0) + idx
+                units.append((id(el), piece))
+        elif estimate_text_chars(el) > max_chars:
+            units.extend((0, piece) for piece in _split_element_lines(el, max_chars))
+        else:
+            units.append((0, el))
+    groups = _pack([u[1] for u in units], max_chars)
+    origin = {id(piece): source for source, piece in units}
+    return [{**block, "elements": _merge_list_pieces(g, origin)} for g in groups]
+
+
+def _merge_list_pieces(group: list[dict[str, Any]], origin: dict[int, int]) -> list[dict[str, Any]]:
+    """Rejoin adjacent single-item list pieces cut from the same ``rich_text_list``."""
+    merged: list[dict[str, Any]] = []
+    prev_source = 0
+    for el in group:
+        source = origin.get(id(el), 0)
+        if source and source == prev_source:
+            merged[-1]["elements"].extend(el["elements"])
+        else:
+            merged.append({**el, "elements": list(el.get("elements") or [])} if source else el)
+        prev_source = source
+    return merged
+
+
+def _split_element_lines(el: dict[str, Any], max_chars: int) -> list[dict[str, Any]]:
+    """Split a quote/preformatted/section element into copies of itself on line boundaries; a
+    single line over budget is cut inside its text."""
+    limit = max(max_chars - 1, 1)  # a rich_text_section costs one extra char
+    lines: list[list[dict[str, Any]]] = [[]]
+    for child in el.get("elements") or []:
+        parts = child.get("text", "").split("\n") if child.get("type") == "text" else [None]
+        for j, part in enumerate(parts):
+            if part is None:
+                lines[-1].append(child)
+                continue
+            last = j == len(parts) - 1
+            if part or not last:
+                lines[-1].append({**child, "text": part if last else part + "\n"})
+            if not last:
+                lines.append([])
+    pieces = [p for line in lines if line for p in _split_long_line(line, limit)]
+    out = []
+    for group in _pack(pieces, limit):
+        children = [c for piece in group for c in piece]
+        tail = children[-1]
+        if tail.get("type") == "text" and tail["text"].endswith("\n"):
+            children[-1] = {**tail, "text": tail["text"].rstrip("\n")}
+        out.append({**el, "elements": _nonempty_elements(children)})
+    return out
+
+
+def _split_long_line(line: list[dict[str, Any]], limit: int) -> list[list[dict[str, Any]]]:
+    if estimate_text_chars(line) <= limit:
+        return [line]
+    atoms: list[dict[str, Any]] = []
+    for child in line:
+        text = child.get("text", "") if child.get("type") == "text" else ""
+        start, cost = 0, 0
+        for i, ch in enumerate(text):
+            c = _text_cost(ch)
+            if cost + c > limit and i > start:
+                atoms.append({**child, "text": text[start:i]})
+                start, cost = i, 0
+            cost += c
+        atoms.append({**child, "text": text[start:]} if text else child)
+    return _pack(atoms, limit)
+
+
+# ----------------------------------------------------------------------------
+# Per-message ``text`` fallback for a batch
+# ----------------------------------------------------------------------------
+
+_MRKDWN_MARKS = (("code", "`"), ("strike", "~"), ("italic", "_"), ("bold", "*"))
+
+
+def _escape_mrkdwn(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _inline_mrkdwn(el: dict[str, Any]) -> str:
+    etype = el.get("type")
+    if etype == "user":
+        return f"<@{el.get('user_id', '')}>"
+    if etype == "channel":
+        return f"<#{el.get('channel_id', '')}>"
+    if etype == "usergroup":
+        return f"<!subteam^{el.get('usergroup_id', '')}>"
+    if etype == "broadcast":
+        return f"<!{el.get('range', 'here')}>"
+    text = _escape_mrkdwn(el.get("text") or "")
+    if etype == "link":
+        url = el.get("url") or ""
+        text = f"<{url}|{text}>" if text and text != url else f"<{url}>"
+    core = text.strip()
+    if not core:
+        return text
+    style = el.get("style") or {}
+    for key, mark in _MRKDWN_MARKS:
+        if style.get(key):
+            core = f"{mark}{core}{mark}"
+    lead = text[: len(text) - len(text.lstrip())]
+    return lead + core + text[len(text.rstrip()):]
+
+
+def _rich_text_mrkdwn(el: dict[str, Any]) -> list[str]:
+    etype = el.get("type")
+    children = el.get("elements") or []
+    if etype == "rich_text_list":
+        start = el.get("offset") or 0
+        pad = "    " * (el.get("indent") or 0)
+        return [
+            pad + (f"{start + i + 1}. " if el.get("style") == "ordered" else "• ")
+            + "".join(_inline_mrkdwn(c) for c in item.get("elements") or [])
+            for i, item in enumerate(children)]
+    text = "".join(_inline_mrkdwn(c) for c in children)
+    if etype == "rich_text_preformatted":
+        return [f"```\n{_escape_mrkdwn(''.join(c.get('text') or '' for c in children))}\n```"]
+    if etype == "rich_text_quote":
+        return [f"> {ln}" for ln in text.split("\n")]
+    return [text]
+
+
+def _table_mrkdwn(block: Block) -> list[str]:
+    return [" | ".join(
+        "".join(_inline_mrkdwn(c) for el in cell.get("elements") or [] for c in el.get("elements") or [])
+        for cell in row) for row in block.get("rows") or []]
+
+
+def _rich_text_lines(block: Block) -> list[str]:
+    return [line for el in block.get("elements") or [] for line in _rich_text_mrkdwn(el)]
+
+
+_FALLBACK_LINES = {
+    "section": lambda b: [(b.get("text") or {}).get("text") or ""],
+    "header": lambda b: [f"*{_escape_mrkdwn((b.get('text') or {}).get('text') or '')}*"],
+    "rich_text": _rich_text_lines,
+    "table": _table_mrkdwn,
+}
+
+
+def blocks_fallback_text(blocks: list[Block]) -> str:
+    """Slack mrkdwn approximating ``blocks``: the notification / accessibility ``text`` of one
+    batch, and what is shown if Slack rejects the batch's blocks."""
+    lines: list[str] = []
+    for block in blocks:
+        lines.extend(_FALLBACK_LINES.get(block.get("type"), lambda _b: [])(block))
+    return "\n".join(lines).strip()
+
+
+def _render_markdown(markdown: str, fmt) -> Optional[list[Block]]:
+    """Render ``markdown`` to one flat block list (no message limits applied)."""
     try:
         blocks: list[Block] = []
         lines = markdown.replace("\r\n", "\n").split("\n")
@@ -540,7 +788,7 @@ def _render_markdown(markdown: str, fmt, build: dict) -> Optional[list[Block]]:
                     body.append(lines[i])
                     i += 1
                 i += 1  # consume closing fence
-                blocks.extend(build["code"]("\n".join(body), fmt))
+                blocks.append(_preformatted_block("\n".join(body)))
                 continue
 
             # Horizontal rule → divider
@@ -554,7 +802,7 @@ def _render_markdown(markdown: str, fmt, build: dict) -> Optional[list[Block]]:
             hm = _HEADER_RE.match(line)
             if hm:
                 flush_para()
-                header = _header_block(hm.group(2))
+                header = _heading_block(hm.group(2), len(hm.group(1)))
                 if header is not None:
                     blocks.append(header)
                 i += 1
@@ -576,7 +824,7 @@ def _render_markdown(markdown: str, fmt, build: dict) -> Optional[list[Block]]:
                 if table is not None:
                     blocks.append(table)
                 else:
-                    blocks.extend(build["code"](_render_table(trows), fmt))
+                    blocks.append(_preformatted_block(_render_table(trows)))
                 continue
 
             # Blockquote group
@@ -589,7 +837,7 @@ def _render_markdown(markdown: str, fmt, build: dict) -> Optional[list[Block]]:
                         break
                     qlines.append(qm.group(1))
                     i += 1
-                blocks.extend(build["quote"](qlines, fmt))
+                blocks.append(_quote_block(qlines))
                 continue
 
             # List group (bullets + ordered, with nesting)
@@ -628,7 +876,7 @@ def _render_markdown(markdown: str, fmt, build: dict) -> Optional[list[Block]]:
                             break
                     else:
                         break
-                blocks.extend(build["list"](items, fmt))
+                blocks.append(_list_block(items))
                 continue
 
             # Default: accumulate into a paragraph
@@ -636,15 +884,10 @@ def _render_markdown(markdown: str, fmt, build: dict) -> Optional[list[Block]]:
             i += 1
         flush_para()
 
-        if not blocks:
-            return None
-        if len(blocks) > MAX_BLOCKS:
-            # Too structurally complex to express safely — let the caller fall
-            # back to plain text rather than truncating and losing content.
-            return None
-        return blocks
+        return blocks or None
     except Exception:
         # Never let a rendering bug drop a message.
+        logging.getLogger(__name__).debug("block render failed; using plain text", exc_info=True)
         return None
 
 
@@ -785,3 +1028,27 @@ def sanitize_blocks(blocks: Optional[list[Block]]) -> Optional[list[Block]]:
     except Exception:
         # A sanitizer bug must never take down the send path.
         return None
+
+
+def heading_marks(node: dict) -> str:
+    """Markdown ``#`` run for a ``header`` block / ``rich_text_header`` element's ``level``."""
+    try:
+        level = int(node.get("level") or 1)
+    except (TypeError, ValueError):
+        level = 1
+    return "#" * min(max(level, 1), 6)
+
+
+def link_mrkdwn(url: str, label: str) -> str:
+    """mrkdwn link; it has no emphasis inside a label, so bold the whole link instead
+    (U+200B before the closing ``*`` as in ``_convert_bold``, since it follows ``>``)."""
+    clean = re.sub(r"\*\*(.+?)\*\*|__(.+?)__", lambda b: b.group(1) or b.group(2), label)
+    link = f"<{url}|{clean}>"
+    return f"*{link}\u200b*" if clean != label else link
+
+
+def plan_messages(chunks: list[str], batches: Optional[list[list[Block]]]) -> list[tuple[str, Optional[list[Block]]]]:
+    """Pair each message's ``text`` fallback with its blocks (``None`` for text-only)."""
+    if batches and len(batches) > 1:
+        return [(blocks_fallback_text(batch) or chunks[0], batch) for batch in batches]
+    return [(chunk, batches[0] if batches and i == 0 else None) for i, chunk in enumerate(chunks)]
