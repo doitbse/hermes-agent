@@ -2266,7 +2266,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
         post as consecutive messages; ``reply_broadcast`` applies to the first only."""
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         broadcast = self.config.extra.get("reply_broadcast", False)
-        messages = plan_messages(chunks, self._block_batches(content) if len(chunks) == 1 else None)
+        messages = plan_messages(chunks, self._block_batches(content))
         last_result = None
         for i, (chunk, blocks) in enumerate(messages):
             kwargs = {
@@ -3151,7 +3151,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
         # "&amp;lt;" twice). ``None`` marks the escape step.
         passes = (
             (r"(```(?:[^\n]*\n)?[\s\S]*?```)", _protect_fence, 0),
-            (r"(`[^`]+`)", lambda m: _ph(m.group(0)), 0),
+            (r"(`[^`]+`)", lambda m: m.group(1)[1:-1] if re.fullmatch(r"<https?://[^>\n]+>|\[[^\]]+\]\([^()\s]+\)", m.group(1)[1:-1]) else _ph(m.group(0)), 0),
             (r"(?<!!)\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)", _convert_markdown_link, 0),
             (r"(<(?:[@#!]|(?:https?|mailto|tel):)[^>\n]+>)", lambda m: _ph(m.group(1)), 0),
             (r"^(>+\s)", lambda m: _ph(m.group(0)), re.MULTILINE),

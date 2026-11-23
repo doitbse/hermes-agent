@@ -153,9 +153,21 @@ def _shield_tokens(text: str) -> Tuple[str, list[_Token]]:
         url, suffix = _trim_url(m.group(0))
         return link(url, url, url) + suffix
 
-    s = _CODE_OR_NUL_RE.sub(
-        lambda m: put(("code", m.group(0), m.group(1)) if m.group(1) else ("text", m.group(0))),
-        text)
+    def code_or_nul(m: re.Match) -> str:
+        if not m.group(1):
+            return put(("text", m.group(0)))
+        code = put(("code", m.group(0), m.group(1)))
+        # `<url|label>` / `[label](url)`: a clickable, code-styled link.
+        for rx, url_i, label_i in ((_LINK_RE, 2, 1), (_SLACK_LINK_RE, 1, 2)):
+            lm = rx.fullmatch(m.group(1))
+            # A bare `<url>` stays literal code; only a labeled link is unwrapped.
+            if lm and lm.group(label_i):
+                label = lm.group(label_i)
+                tokens[-1] = ("code", f"`{label}`", label)
+                return put(("link", m.group(0), lm.group(url_i), code))
+        return code
+
+    s = _CODE_OR_NUL_RE.sub(code_or_nul, text)
     s = _LINK_RE.sub(lambda m: link(m.group(2), m.group(1), m.group(0)), s)
     s = _SLACK_LINK_RE.sub(lambda m: link(m.group(1), m.group(2) or m.group(1), m.group(0)), s)
     s = _BARE_URL_RE.sub(bare_url, s)
@@ -1049,6 +1061,6 @@ def link_mrkdwn(url: str, label: str) -> str:
 
 def plan_messages(chunks: list[str], batches: Optional[list[list[Block]]]) -> list[tuple[str, Optional[list[Block]]]]:
     """Pair each message's ``text`` fallback with its blocks (``None`` for text-only)."""
-    if batches and len(batches) > 1:
+    if batches and (len(batches) > 1 or len(chunks) > 1):
         return [(blocks_fallback_text(batch) or chunks[0], batch) for batch in batches]
     return [(chunk, batches[0] if batches and i == 0 else None) for i, chunk in enumerate(chunks)]
