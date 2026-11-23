@@ -294,6 +294,38 @@ class TestFormatMessageBoldLinkLabel:
         assert adapter.format_message("[docs](https://example.com)") == "<https://example.com|docs>"
 
 
+class TestLongReplyKeepsBlocks:
+    @pytest.mark.asyncio
+    async def test_over_39k_multi_batch_reply_posts_all_blocks(self):
+        adapter, client = _make_adapter({"rich_blocks": True})
+        para = "word " * 199 + "end"
+        content = "\n\n".join(f"{para} https://example.com/{i}" for i in range(55))
+        content += "\n\n" + RICH_TABLE_MD
+        assert len(content) > 39000
+        assert len(adapter.truncate_message(content, adapter.MAX_MESSAGE_LENGTH)) == 2
+        await adapter.send("C1", content)
+        calls = [c.kwargs for c in client.chat_postMessage.await_args_list]
+        assert len(calls) > 1
+        assert all(c.get("blocks") for c in calls)
+        assert "table" in [b["type"] for b in calls[-1]["blocks"]]
+
+
+class TestFormatMessageBacktickLinks:
+    def test_backtick_slack_link(self):
+        adapter, _ = _make_adapter()
+        assert adapter.format_message("`<https://example.com|FUSE-2651>`") == (
+            "<https://example.com|FUSE-2651>")
+
+    def test_backtick_markdown_link(self):
+        adapter, _ = _make_adapter()
+        assert adapter.format_message("`[doitbse/resolve](https://github.com/doitbse/resolve)`") == (
+            "<https://github.com/doitbse/resolve|doitbse/resolve>")
+
+    def test_plain_inline_code_untouched(self):
+        adapter, _ = _make_adapter()
+        assert adapter.format_message("`foo`") == "`foo`"
+
+
 class TestInboundHeaders:
     def test_header_block_and_rich_text_header_render_as_markdown_headings(self):
         from plugins.platforms.slack.adapter import _extract_text_from_slack_blocks

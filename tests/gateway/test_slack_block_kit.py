@@ -10,6 +10,7 @@ from plugins.platforms.slack.block_kit import (
     _render_markdown,
     blocks_fallback_text,
     estimate_text_chars,
+    plan_messages,
     render_block_batches,
     render_blocks,
     sanitize_blocks,
@@ -307,7 +308,7 @@ class TestEmphasisWrappingOpaqueTokens:
         ]
 
     @pytest.mark.parametrize(
-        "code", ["foo_bar_baz", "**not bold**", "a ** b", "<@U123>", "a[0](1)", "<https://x.com|y>"]
+        "code", ["foo_bar_baz", "**not bold**", "a ** b", "<@U123>", "a[0](1)", "<https://x.com>"]
     )
     def test_code_span_contents_stay_literal_inside_and_outside_bold(self, code):
         assert _list_item(f"- `{code}`") == [{"type": "text", "text": code, "style": {"code": True}}]
@@ -798,3 +799,27 @@ class TestBatchFallbackText:
         batches = render_block_batches(_long_nested_list_md())
         numbered = [ln for ln in blocks_fallback_text(batches[1]).splitlines() if ln[0].isdigit()]
         assert int(numbered[0].split(".", 1)[0]) == _ordered_numbers(batches[1:])[0] > 1
+
+
+class TestPlanMessagesAndCodeLinks:
+    def test_multi_chunk_keeps_all_batches(self):
+        batches = [[{"type": "divider"}], [{"type": "table", "rows": []}]]
+        out = plan_messages(["a" * 5, "b" * 5], batches)
+        assert [b for _, b in out] == batches
+
+    def test_single_chunk_single_batch_keeps_chunk_text(self):
+        batch = [{"type": "divider"}]
+        assert plan_messages(["hello"], [batch]) == [("hello", batch)]
+
+    def test_no_batches_is_text_only(self):
+        assert plan_messages(["a", "b"], None) == [("a", None), ("b", None)]
+
+    @pytest.mark.parametrize("md, url, label", [
+        ("`<https://example.com|FUSE-2651>`", "https://example.com", "FUSE-2651"),
+        ("`[doitbse/resolve](https://github.com/doitbse/resolve)`",
+         "https://github.com/doitbse/resolve", "doitbse/resolve"),
+    ])
+    def test_backtick_wrapped_link_is_clickable_code(self, md, url, label):
+        from plugins.platforms.slack.block_kit import _inline_elements
+        assert _inline_elements(md) == [
+            {"type": "link", "url": url, "text": label, "style": {"code": True}}]
