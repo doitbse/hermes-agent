@@ -275,3 +275,147 @@ async def test_fold_tokenizes_markdown_details_and_strips_heading_from_title(mon
     details1 = plan["tasks"][1]["details"]["elements"][0]["elements"]
     assert {"type": "text", "text": "prs-check.py", "style": {"code": True}} in details1
 
+
+def test_trailing_mid_sentence_paragraph_stays_folded_and_partial_words_are_trimmed():
+    """A new paragraph after a blank line is a token stub until its first sentence finishes: the
+    previous paragraph's sentence stays the active title, and the stub rides in its details."""
+    from gateway.run_turn_thinking import parse_thought_sections
+
+    done = "I'm reviewing the retry loop. It backs off linearly."
+    for stub in ("I'", "I'm mar", "I'm weighing whether"):
+        sections = parse_thought_sections(f"{done}\n\n{stub}")
+        assert [s["title"] for s in sections] == ["I'm reviewing the retry loop."]
+        assert sections[0]["details"].endswith(stub)
+    promoted = parse_thought_sections(f"{done}\n\nI'm weighing whether to cap it. Maybe")
+    assert [s["title"] for s in promoted] == ["I'm reviewing the retry loop.", "I'm weighing whether to cap it."]
+
+    live = parse_thought_sections("I'm checking the configu")[0]
+    assert live["live_title"] == "I'm checking the…"
+    assert live["title"] == "I'm checking the configu"  # folded plan rows keep the raw text
+    assert parse_thought_sections("I'm checking the config,")[0]["live_title"] == "I'm checking the…"
+    assert parse_thought_sections("I'm checking the config.")[0]["live_title"] == "I'm checking the config."
+
+    headed = parse_thought_sections("**Tracing retries**\n\nI'm mar")[0]
+    assert headed["live_title"] == "*Tracing retries*"
+    headed = parse_thought_sections("**Tracing retries**\n\nI'm mapping callers. Next")[0]
+    assert headed["live_title"] == "*Tracing retries*: I'm mapping callers."
+
+
+def test_thought_accumulator_holds_token_stubs():
+    from gateway.run_turn_thinking import ThoughtAccumulator
+
+    acc = ThoughtAccumulator()
+    assert acc.feed("I'") is None
+    assert acc.feed("m mar") is None
+    assert acc.feed("king the slow path in the scheduler")["live_title"] == "I'm marking the slow path in the…"
+    assert ThoughtAccumulator().feed("Done.")["title"] == "Done."
+
+
+def test_parallel_subagent_paragraphs_keep_one_row_per_segment():
+    """Ten subagents each streaming 25 paragraphs: one row per (subagent, segment), the window
+    shows the six that most recently finished a new sentence, and no stub ever renders."""
+    from gateway.run_turn_progress import GatewayTurnProgressMixin
+    from plugins.platforms.slack.task_cards import _window_text
+
+    st = GatewayTurnProgressMixin._TaskCardState(adapter=None, thinking=True)
+    sids = [f"sa{i}" for i in range(10)]
+    bufs = dict.fromkeys(sids, "")
+    for sid in sids:
+        st.apply_event({"type": "subagent.start", "subagent_id": sid, "goal": f"task {sid}"})
+
+    def push(sid, text):
+        bufs[sid] += text
+        st.apply_event({"type": "subagent.thinking", "subagent_id": sid, "preview": bufs[sid]})
+
+    for p in range(25):
+        for sid in sids:
+            sep = "\n\n" if bufs[sid] else ""
+            for chunk in (f"{sep}I'", "m mar", f"king {sid} step {p} as weighed. It", " holds."):
+                push(sid, chunk)
+                if any(t["kind"] == "thought" for t in st.all_tasks()):
+                    lines = _window_text(st.all_tasks()).splitlines()
+                    assert all(line.endswith(".") for line in lines), lines
+
+    thoughts = [t for t in st.all_tasks() if t["kind"] == "thought"]
+    assert len(thoughts) == len(sids)
+    assert len(st.all_tasks()) == 2 * len(sids)  # one subagent row + one thought row each
+    assert [t["owner"] for t in thoughts[-6:]] == sids[-6:]
+    assert _window_text(st.all_tasks()).splitlines() == [
+        f"• I'm marking {sid} step 24 as weighed." for sid in sids[-6:]]
+
+    # The first subagent advancing re-enters the window's tail.
+    push("sa0", "\n\nI'm closing out the first audit now. Done.")
+    assert st.task_order[-1] == "thought_sub_sa0_1"
+    assert _window_text(st.all_tasks()).splitlines()[-1] == "• I'm closing out the first audit now."
+
+
+def _relay(monkeypatch, clock):
+    from tools import delegate_tool_progress
+    from tools.delegate_tool_progress import _ChildProgressRelay
+
+    monkeypatch.setattr(delegate_tool_progress.time, "monotonic", lambda: clock[0])
+    events = []
+
+    def parent_cb(event_type, tool_name, preview, args, **kwargs):
+        events.append((event_type, preview))
+
+    relay = _ChildProgressRelay(0, "goal", None, parent_cb, 1, "sa1", None, 1, None, None, {})
+    return relay, events
+
+
+def test_child_relay_coalesces_first_reasoning_fragment(monkeypatch):
+    clock = [100.0]
+    relay, events = _relay(monkeypatch, clock)
+    relay.on_reasoning("I'")
+    relay.on_reasoning("m mar")
+    assert events == []
+    clock[0] += 0.5
+    relay.on_reasoning("king the")
+    assert events == []
+    clock[0] += 0.6
+    relay.on_reasoning(" path")
+    assert events == [("subagent.thinking", "I'm marking the path")]
+
+    # A short fragment is never lost: the flush relays it even before the interval.
+    events.clear()
+    relay._flush_reasoning()
+    relay.on_reasoning("I'm che")
+    relay._flush_reasoning()
+    assert events == [("subagent.thinking", "I'm che")]
+
+    # A complete sentence in one non-streamed call still relays immediately.
+    events.clear()
+    relay.on_reasoning("Checked the build.")
+    assert events == [("subagent.thinking", "Checked the build.")]
+
+
+def test_child_relay_flushes_reasoning_tail_on_text_and_thinking(monkeypatch):
+    clock = [100.0]
+    relay, events = _relay(monkeypatch, clock)
+    relay.on_reasoning("I'm checking the retry budget for the worker.")
+    relay.on_reasoning(" Then I'll compare")
+    relay._on_text(None, "The answer", None, {})
+    assert events == [
+        ("subagent.thinking", "I'm checking the retry budget for the worker."),
+        ("subagent.thinking", "I'm checking the retry budget for the worker. Then I'll compare"),
+        ("subagent.text", "The answer"),
+    ]
+
+    events.clear()
+    full = "First paragraph is done.\n\nSecond paragraph keeps going"
+    relay.on_reasoning(full)
+    relay.on_reasoning(" and finishes.")
+    relay._on_thinking(None, "First paragraph is done.", None, {})
+    assert events == [("subagent.thinking", full), ("subagent.thinking", full + " and finishes.")]
+
+    # Fully sent already: the post-response summary must not clobber the streamed buffer.
+    events.clear()
+    relay.on_reasoning(full)
+    relay._on_thinking(None, "First paragraph is done.", None, {})
+    assert events == [("subagent.thinking", full)]
+
+    # Nothing streamed for this segment: the summary is relayed as before.
+    events.clear()
+    relay._on_thinking(None, "Plain summary line", None, {})
+    assert events == [("subagent.thinking", "Plain summary line")]
+

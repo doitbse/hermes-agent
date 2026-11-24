@@ -6,6 +6,7 @@ import logging
 import enum
 import os
 import posixpath
+import re
 import threading
 import time
 from contextlib import contextmanager
@@ -328,6 +329,10 @@ class _ChildProgressRelay:
     _BATCH_SIZE = 5
     # Child reasoning streams per token; relay at most one cumulative preview per interval.
     _REASONING_INTERVAL = 1.0
+    # A segment's first snapshot waits for this much text or a finished sentence, so the
+    # gateway never renders a one-token stub ("I'") as a thought.
+    _REASONING_FIRST_CHARS = 40
+    _SENTENCE_DONE_RE = re.compile(r"(?<=[.!?])\s|[.!?][\"')\]}]*$|\n")
 
     def __init__(
         self, task_index: int, goal: str, spinner: Any, parent_cb: Any, task_count: int,
@@ -393,6 +398,11 @@ class _ChildProgressRelay:
         with self._reasoning_lock:
             self._reasoning_buf += text
             now = time.monotonic()
+            if self._reasoning_at == 0.0:
+                head = self._reasoning_buf.strip()
+                if len(head) < self._REASONING_FIRST_CHARS and not self._SENTENCE_DONE_RE.search(head):
+                    self._reasoning_at = now
+                    return
             if now - self._reasoning_at < self._REASONING_INTERVAL:
                 return
             self._reasoning_at, self._reasoning_sent, preview = now, len(self._reasoning_buf), self._reasoning_buf
@@ -437,14 +447,23 @@ class _ChildProgressRelay:
 
     def _on_text(self, tool_name, preview, args, kwargs):
         # Streamed child reply text, relayed verbatim for gateway watch windows;
-        # inert on CLI/TUI (their progress handlers ignore non-tool events).
+        # inert on CLI/TUI (their progress handlers ignore non-tool events). Reasoning ends where
+        # the reply starts: flush its tail now rather than strand it until the next tool.
+        self._flush_reasoning()
         self._relay("subagent.text", preview=preview)
 
     # ── DelegateEvent handlers ──
     def _on_thinking(self, tool_name, preview, args, kwargs):
         text = preview or tool_name or ""
         self._tree_line(f'💭 "{_short(text, 55)}"')
-        self._relay("subagent.thinking", preview=text)
+        with self._reasoning_lock:
+            streamed = bool(self._reasoning_buf or self._reasoning_sent)
+        if streamed:
+            # on_reasoning already relayed this segment cumulatively; the post-response summary
+            # is an 80-char prefix of it, so flush the tail instead of replacing the buffer.
+            self._flush_reasoning()
+        else:
+            self._relay("subagent.thinking", preview=text)
 
     def _on_progress(self, tool_name, preview, args, kwargs):
         # Pre-batched summary from a nested orchestrator's grandchild arrives in the tool_name slot: render distinctly

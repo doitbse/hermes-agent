@@ -43,6 +43,10 @@ _HEADING_RE = re.compile(
     r")"
 )
 _TITLE_MARKS_RE = re.compile(r"(?m)`|\*\*|__|^\s*#+\s*")
+_COMPLETE_SENTENCE_RE = re.compile(r"(?<=[.!?])\s|[.!?][\"')\]]*$")
+# Streamed reasoning shorter than this with no finished sentence is a token stub ("I'm mar").
+_MIN_STUB_CHARS = 24
+_PARTIAL_TAIL = ",;:-–—"
 
 _background_tasks: set[asyncio.Task] = set()
 
@@ -84,12 +88,18 @@ def _clean_plain(text: str) -> str:
     return re.sub(r"\s+", " ", _TITLE_MARKS_RE.sub("", text)).strip()
 
 
+def _has_complete_sentence(text: str) -> bool:
+    """True once ``text`` holds a finished sentence (terminator + whitespace, or at the end)."""
+    return bool(_COMPLETE_SENTENCE_RE.search(str(text or "").strip()))
+
+
 def _headed_section(heading: str, body: str) -> dict[str, str]:
     """Case A: a bold/markdown heading followed by body text (Gemini-style thoughts)."""
     heading = re.sub(r"\s+", " ", heading).strip()
     details = re.sub(r"^[\s:\-–—]+", "", body).strip()[:_DETAILS_CHARS]
     title = _cap(_clean_plain(heading))
-    if details:
+    # A heading followed by a token stub shows the heading alone until that sentence lands.
+    if details and (_has_complete_sentence(details) or len(details) >= _TITLE_CHARS):
         first_sent = _SENTENCE_END.split(details, 1)[0].strip()
         live_title = _cap(f"*{heading}*: {first_sent}")
     else:
@@ -103,8 +113,15 @@ def _prose_section(text: str) -> dict[str, str]:
     parts = _SENTENCE_END.split(stripped, 1)
     first_sent = parts[0].strip()
     rest = parts[1].strip() if len(parts) > 1 else ""
+    live = first_sent
+    if not _has_complete_sentence(first_sent):
+        # Still streaming: drop a half-received trailing word and mark the line as in progress.
+        if not text.endswith((" ", "\n", "\t")) and " " in first_sent:
+            live = first_sent.rsplit(" ", 1)[0].rstrip(_PARTIAL_TAIL) + "…"
+        else:
+            live = first_sent.rstrip(_PARTIAL_TAIL) + "…"
     return {"title": _cap(_clean_plain(first_sent)), "details": rest[:_DETAILS_CHARS],
-            "live_title": _cap(first_sent)}
+            "live_title": _cap(live)}
 
 
 _CONTINUATION_BLOCK_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)]|```)\s*")
@@ -121,6 +138,11 @@ def _unheaded_sections(text: str) -> list[dict[str, str]]:
             paragraphs[-1] = f"{paragraphs[-1]}\n\n{block}"
         else:
             paragraphs.append(block)
+    # A paragraph still mid-first-sentence stays folded into the previous one, so the last
+    # finished sentence remains the active title instead of a token stub ("I'm mar").
+    if len(paragraphs) > 1 and not _has_complete_sentence(paragraphs[-1]) and len(paragraphs[-1]) < _TITLE_CHARS:
+        tail = paragraphs.pop()
+        paragraphs[-1] = f"{paragraphs[-1]}\n\n{tail}"
     return [_prose_section(p) for p in (paragraphs or [text])]
 
 
@@ -165,6 +187,8 @@ class ThoughtAccumulator:
             else:
                 self._buf += text
             full, seq = self._buf, self._seq
+        if len(full.strip()) < _MIN_STUB_CHARS and not _has_complete_sentence(full):
+            return None
         sections = parse_thought_sections(full)
         if not sections or not sections[0]["title"]:
             return None
@@ -282,6 +306,32 @@ def _apply_thought(st, raw: dict) -> bool:
     return True
 
 
+def _apply_subagent_thought(st, sid: str, raw_text: str) -> None:
+    """One row per ``(subagent, segment)`` showing its latest thought. Parallel subagents each
+    stream dozens of paragraphs; a row per paragraph would bury the live window under stubs."""
+    seq = st.subagent_segments.setdefault(sid, 1)
+    base_id = f"thought_sub_{sid}_{seq}"
+    if not raw_text or (base_id not in st.tasks and len(raw_text) < _MIN_STUB_CHARS
+                        and not _has_complete_sentence(raw_text)):
+        return
+    sections = parse_thought_sections(raw_text)
+    if not sections or not sections[-1].get("title"):
+        return
+    section = sections[-1]
+    new_title = st._compact(section.get("title") or "…", 180)
+    live_title = str(section.get("live_title") or section.get("title") or "…")
+    details = str(section.get("details") or "") if len(sections) == 1 else raw_text[:_DETAILS_CHARS]
+    if base_id not in st.tasks:
+        _settle_running(st, kind="thought", owner=sid)
+    prev_title = st.tasks.get(base_id, {}).get("title")
+    _put(st, base_id, kind="thought", owner=sid, status="in_progress",
+         title=new_title, live_title=live_title, details=details)
+    # A subagent that moved on to a new thought re-enters the tail of the live window.
+    if prev_title and prev_title != new_title and st.task_order and st.task_order[-1] != base_id:
+        st.task_order.remove(base_id)
+        st.task_order.append(base_id)
+
+
 def _apply_subagent(st, raw: dict) -> bool:
     event_type, sid = raw["type"], raw["subagent_id"]
     goal = st._compact(raw.get("goal"), 80)
@@ -290,9 +340,7 @@ def _apply_subagent(st, raw: dict) -> bool:
         st.delegation_id = st.delegation_id or raw.get("delegation_id") or ""
         _put(st, f"sub_{sid}", kind="tool", owner=sid, title=f"subagent - {goal}" if goal else "subagent")
     elif event_type == "subagent.thinking":
-        seq = st.subagent_segments.setdefault(sid, 1)
-        base_id = f"thought_sub_{sid}_{seq}"
-        _apply_sections(st, base_id, parse_thought_sections(raw.get("preview") or ""), owner=sid)
+        _apply_subagent_thought(st, sid, str(raw.get("preview") or ""))
     elif event_type == "subagent.tool":
         st.subagent_segments[sid] = st.subagent_segments.get(sid, 1) + 1
         st.subagent_tools[sid] = st.subagent_tools.get(sid, 0) + 1
