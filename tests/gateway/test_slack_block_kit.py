@@ -47,6 +47,42 @@ class TestNestedLists:
         assert min(indents) == 0
 
 
+class TestListFollowedByIndentedBlock:
+    def test_indented_table_not_inlined_into_bullet(self):
+        md = (
+            "- **Encryption tiers:**\n"
+            "  | Tier | File | KMS Key | Contents |\n"
+            "  |---|---|---|---|\n"
+            "  | 1 | a.yaml | key-a | secrets |\n"
+            "- **Control-plane IAM hardening:** restrict roles"
+        )
+        blocks = render_blocks(md)
+        assert _types(blocks) == ["rich_text", "table", "rich_text"]
+        first = blocks[0]["elements"][0]
+        assert first["type"] == "rich_text_list"
+        assert len(first["elements"]) == 1
+        assert "|" not in str(first)
+        assert "Control-plane IAM hardening" in str(blocks[2])
+
+    def test_indented_fence_emitted_as_preformatted(self):
+        md = (
+            "- Run this:\n"
+            "  ```bash\n"
+            "  echo hi\n"
+            "    nested\n"
+            "  ```\n"
+            "- Next step"
+        )
+        blocks = render_blocks(md)
+        assert _types(blocks) == ["rich_text", "rich_text", "rich_text"]
+        pre = blocks[1]["elements"][0]
+        assert pre["type"] == "rich_text_preformatted"
+        assert pre["elements"][0]["text"] == "echo hi\n  nested"
+        assert "```" not in str(blocks[0])
+        assert "echo" not in str(blocks[0])
+        assert "Next step" in str(blocks[2])
+
+
 class TestInlineFormatting:
 
     def test_slack_mrkdwn_link_in_bullet_becomes_link_element(self):

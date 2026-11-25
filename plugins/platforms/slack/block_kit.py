@@ -53,18 +53,30 @@ Block = dict[str, Any]
 # Line classification
 # ----------------------------------------------------------------------------
 
-_HR_RE = re.compile(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$")
-_HEADER_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
-_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+_HR_RE = re.compile(r"^\s*([-*_])(?:\s*\1){2,}\s*$")
+_HEADER_RE = re.compile(r"^\s*(#{1,6})\s+(.+?)\s*#*\s*$")
+_FENCE_RE = re.compile(r"^(\s*)(`{3,}|~{3,})(.*)$")
 _ORDERED_RE = re.compile(r"^(\s*)(\d+)[.)]\s+(.*)$")
 _BULLET_RE = re.compile(r"^(\s*)[-*+]\s+(.*)$")
-_QUOTE_RE = re.compile(r"^\s{0,3}>\s?(.*)$")
+_QUOTE_RE = re.compile(r"^\s*>\s?(.*)$")
 _TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$")
 
 
 def _is_list_line(line: str) -> bool:
     """True if ``line`` is a markdown list item (bullet or ordered)."""
     return bool(_BULLET_RE.match(line) or _ORDERED_RE.match(line))
+
+
+def _is_block_start(lines: list[str], i: int) -> bool:
+    """True if ``lines[i]`` opens a fence, rule, header, quote, or pipe table."""
+    line = lines[i]
+    return bool(
+        _FENCE_RE.match(line)
+        or _HR_RE.match(line)
+        or _HEADER_RE.match(line)
+        or _QUOTE_RE.match(line)
+        or ("|" in line and i + 1 < len(lines) and _TABLE_SEP_RE.match(lines[i + 1]))
+    )
 
 
 def _indent_level(spaces: str) -> int:
@@ -793,11 +805,13 @@ def _render_markdown(markdown: str, fmt) -> Optional[list[Block]]:
             fence = _FENCE_RE.match(line)
             if fence:
                 flush_para()
-                marker = fence.group(1)
+                indent, marker = len(fence.group(1)), fence.group(2)
                 body: list[str] = []
                 i += 1
                 while i < n and not lines[i].lstrip().startswith(marker):
-                    body.append(lines[i])
+                    # Strip up to the opening fence's indentation from body lines.
+                    ln = lines[i]
+                    body.append(ln[min(indent, len(ln) - len(ln.lstrip())):])
                     i += 1
                 i += 1  # consume closing fence
                 blocks.append(_preformatted_block("\n".join(body)))
@@ -865,6 +879,9 @@ def _render_markdown(markdown: str, fmt) -> Optional[list[Block]]:
                     elif om:
                         items.append((_indent_level(om.group(1)), True, om.group(3)))
                         i += 1
+                    elif _is_block_start(lines, i):
+                        # Indented table/fence/quote/header/rule: let the outer loop handle it.
+                        break
                     elif lines[i].strip() and lines[i].startswith((" ", "\t")) and items:
                         # continuation line of the previous item
                         indent, ordered, txt = items[-1]
