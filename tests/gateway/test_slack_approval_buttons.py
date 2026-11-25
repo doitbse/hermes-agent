@@ -475,6 +475,72 @@ class TestSlackThreadContext:
         # self-bot.
         assert "[assistant] Own T2 bot reply" in context
 
+    @staticmethod
+    def _thread_with_own_turn():
+        """Parent, the user's trigger (= watermark), this bot's folded thinking card and its
+        ``rich_blocks`` reply (mrkdwn ``text`` re-rendered as blocks), a peer reply, then the
+        new trigger."""
+        card = {
+            "ts": "1000.2", "bot_id": "B_SELF", "user": "U_BOT",
+            "text": "Thought for 23m 34s · 89 steps",
+            "blocks": [{"type": "plan", "title": "Thought for 23m 34s · 89 steps", "tasks": []}],
+        }
+        reply = {
+            "ts": "1000.3", "bot_id": "B_SELF", "user": "U_BOT",
+            "text": "*Summary*: the deploy is green.",
+            "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": "*Summary*: the deploy is green."}},
+                {"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": [
+                    {"type": "text", "text": "Summary", "style": {"bold": True}},
+                    {"type": "text", "text": ": the deploy is green."}]}]},
+            ],
+        }
+        return [
+            {"ts": "1000.0", "user": "U1", "text": "Parent question"},
+            {"ts": "1000.1", "user": "U1", "text": "First trigger"},
+            card,
+            reply,
+            {"ts": "1000.4", "user": "U2", "text": "Peer follow-up"},
+            {"ts": "1000.5", "user": "U1", "text": "Current"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_delta_refresh_skips_own_turn_and_thinking_card(self):
+        """The watermark is the triggering USER message's ts, so the bot's own reply and its
+        thinking card land past it; both are already in session history and must not be
+        replayed as ``[Thread context]`` on a delta refresh."""
+        adapter = _make_adapter()
+        adapter._team_clients["T1"].conversations_replies = AsyncMock(
+            return_value={"messages": self._thread_with_own_turn()})
+        adapter._user_name_cache = {("T1", "U1"): "Alice", ("T1", "U2"): "Bob"}
+
+        context = await adapter._fetch_thread_context(
+            channel_id="C1", thread_ts="1000.0", current_ts="1000.5", team_id="T1",
+            after_ts="1000.1", force_refresh=True,
+        )
+
+        assert "Peer follow-up" in context
+        assert "Thought for" not in context
+        assert "deploy is green" not in context
+        assert "[assistant]" not in context
+        assert "First trigger" not in context
+
+    @pytest.mark.asyncio
+    async def test_cold_start_drops_thinking_card_and_dedupes_rich_blocks_reply(self):
+        adapter = _make_adapter()
+        adapter._team_clients["T1"].conversations_replies = AsyncMock(
+            return_value={"messages": self._thread_with_own_turn()})
+        adapter._user_name_cache = {("T1", "U1"): "Alice", ("T1", "U2"): "Bob"}
+
+        context = await adapter._fetch_thread_context(
+            channel_id="C1", thread_ts="1000.0", current_ts="1000.5", team_id="T1",
+        )
+
+        assert "Thought for" not in context
+        assert context.count("deploy is green") == 1
+        assert "[assistant] *Summary*: the deploy is green." in context
+        assert "Peer follow-up" in context
+
 
 # ===========================================================================
 # _has_active_session_for_thread — session key fix (#5833)

@@ -6027,6 +6027,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         See #23918.
         """
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+        own_ids = own_bot_ids(self._bot_user_id, self._team_bot_user_ids)
         context_parts = []
         parent_text = ""
         for msg in messages:
@@ -6039,8 +6040,18 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             skip_for_delta = bool(after_ts and msg_ts and msg_ts <= after_ts)
             if skip_for_delta and not is_parent:
                 continue
-            msg_text = self._render_message_text(
-                msg, bot_uid=bot_uid, own_ids=own_bot_ids(self._bot_user_id, self._team_bot_user_ids))
+            render_msg = msg
+            if not is_parent and self._is_self_bot_reply(msg, team_id):
+                # The watermark is the triggering USER message's ts, so this bot's own reply and
+                # thinking card always land past it; they are already in session history, so a
+                # delta would replay them. Thinking cards are progress chatter in any mode.
+                if after_ts or task_cards.is_task_card_message(msg):
+                    continue
+                # Own ``rich_blocks`` replies carry the full mrkdwn in ``text`` and re-render it
+                # in blocks; extracting both duplicates the reply.
+                if (msg.get("text") or "").strip():
+                    render_msg = {k: v for k, v in msg.items() if k != "blocks"}
+            msg_text = self._render_message_text(render_msg, bot_uid=bot_uid, own_ids=own_ids)
             if not msg_text:
                 continue
             if bot_uid:
@@ -6073,6 +6084,15 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             content = header + "\n" + "\n".join(context_parts) + "\n[End of thread context]\n\n"
         return content, parent_text
 
+    def _is_self_bot_reply(self, msg: dict, team_id: str) -> bool:
+        """True when ``msg`` was posted by this adapter's bot user for the message's workspace."""
+        msg_team = msg.get("team") or team_id  # our own bot for this message's workspace
+        self_bot_uid = (
+            self._team_bot_user_ids.get(msg_team) if msg_team else None
+        ) or self._bot_user_id
+        return bool(
+            self_bot_uid and msg.get("user", "") == self_bot_uid and self._event_declares_bot_sender(msg))
+
     async def _thread_context_line(
         self, msg: dict, msg_text: str, is_parent: bool, team_id: str, channel_id: str, *,
         chat_type: str = "group", thread_ts: str = "") -> str:
@@ -6087,11 +6107,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         from gateway.session import neutralize_untrusted_inline_text
         is_bot = self._event_declares_bot_sender(msg)
         msg_user = msg.get("user", "")
-        msg_team = msg.get("team") or team_id  # our own bot for this message's workspace
-        self_bot_uid = (
-            self._team_bot_user_ids.get(msg_team) if msg_team else None
-        ) or self._bot_user_id
-        is_self_bot_reply = is_bot and not is_parent and self_bot_uid and msg_user == self_bot_uid
+        is_self_bot_reply = not is_parent and self._is_self_bot_reply(msg, team_id)
         prefix = "[thread parent] " if is_parent else "[assistant] " if is_self_bot_reply else ""
         if is_self_bot_reply:
             return f"{prefix}{msg_text}"

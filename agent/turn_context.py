@@ -1529,6 +1529,7 @@ def build_api_messages(
         # Strip length-continuation marks; some transports keep underscore keys.
         api_msg.pop("_length_continuation_fragment", None)
         api_msg.pop("_length_continuation_nudge", None)
+        api_msg.pop("_length_continuation_invisible_stub", None)
         # Strip Codex Responses fields (call_id, response_item_id): strict providers
         # reject unknown fields. New dicts keep the internal list intact for Codex.
         if agent._should_sanitize_tool_calls():

@@ -76,6 +76,20 @@ _UNTERMINATED_TOOL_CALL_PATTERN = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+# Tokenizer special tokens some providers leak as the whole "content" (e.g. Gemma's
+# ``<end_of_image>``): a response consisting of ONLY these carries no visible text.
+_LEAKED_SPECIAL_TOKENS_ONLY_RE = re.compile(
+    r"^(?:\s*(?:<end_of_image>|<start_of_image>|<\|endoftext\|>|<\|im_end\|>|<\|im_start\|>"
+    r"|<\|eot_id\|>|<\|end_of_text\|>|<\|begin_of_text\|>|<eos>|<pad>)\s*)+$",
+    re.IGNORECASE,
+)
+
+
+def is_leaked_special_tokens_only(content: Any) -> bool:
+    """True when ``content`` is non-empty and made up solely of leaked special tokens."""
+    text = _flatten_content_text(content) if content else ""
+    return bool(text) and isinstance(text, str) and bool(_LEAKED_SPECIAL_TOKENS_ONLY_RE.fullmatch(text))
+
 
 def _ra():
     """Lazy ``run_agent`` reference for test-patch routing."""
@@ -439,6 +453,8 @@ def strip_think_blocks(agent, content: str) -> str:
     content = _flatten_content_text(content) if content else ""
     for pattern in _THINK_STRIP_PATTERNS if content else ():
         content = pattern.sub('', content)
+    if content and _LEAKED_SPECIAL_TOKENS_ONLY_RE.fullmatch(content):
+        return ""
     return content
 
 

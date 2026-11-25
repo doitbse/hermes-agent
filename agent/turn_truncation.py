@@ -315,17 +315,26 @@ def _content_filter_fallback(st: _Trunc, _retry: TurnRetryState) -> Optional[Tru
     return None
 
 
+_INVISIBLE_STUB_KEY = "_length_continuation_invisible_stub"
+
+
 def _repeated_stub_failure(st: _Trunc, _retry: TurnRetryState, content: Any) -> Optional[TruncationVerdict]:
     """A clean-EOF stub repeating the previous stub fragment verbatim is a deterministic
     provider failure: drop the trail (stitching would persist the duplicates), then try
     the fallback chain, else end the turn with an explicit notice."""
+    # Raw (pre think/special-token strip) text: a repeated ``<end_of_image>``-only stub is
+    # never recorded as a fragment, so it is matched against the tag on the previous nudge.
     visible = content.strip() if isinstance(content, str) else ""
-    if not (st.is_stub and getattr(st.response, "_clean_eof", False) and visible
-            and st.truncated_response_parts):
+    if not (st.is_stub and getattr(st.response, "_clean_eof", False) and visible):
         return None
-    prev_text, prev_is_stub = st.truncated_response_parts[-1]
-    if not (prev_is_stub and isinstance(prev_text, str) and prev_text.strip() == visible):
-        return None
+    last = st.messages[-1] if st.messages else None
+    repeated_invisible = isinstance(last, dict) and last.get(_INVISIBLE_STUB_KEY) == visible
+    if not repeated_invisible:
+        if not st.truncated_response_parts:
+            return None
+        prev_text, prev_is_stub = st.truncated_response_parts[-1]
+        if not (prev_is_stub and isinstance(prev_text, str) and prev_text.strip() == visible):
+            return None
     agent = st.agent
     idx = st.current_turn_user_idx
     turn_start = idx + 1 if isinstance(idx, int) and idx >= 0 else 0
@@ -376,6 +385,13 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
         return repeated
     agent = st.agent
     messages = st.messages
+    # Content with no visible text (only leaked special tokens like ``<end_of_image>``, or
+    # only reasoning) is not a fragment: persisting it would stitch garbage into the reply.
+    _invisible_stub = None
+    if isinstance(_interim_content, str) and _interim_content:
+        if not agent._strip_think_blocks(_interim_content).strip():
+            _invisible_stub = _interim_content.strip() if st.is_stub else None
+            _interim_content = None
     st.length_continue_retries += 1
     n = st.length_continue_retries
     if not _interim_content and not st.is_stub:
@@ -399,10 +415,13 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
             agent._vprint(f"{agent.log_prefix}↻ Stream interrupted — requesting continuation ({n}/4)...", diagnostic=True)
         else:
             agent._vprint(f"{agent.log_prefix}↻ Requesting continuation ({n}/4)...", diagnostic=True)
-        append_message(messages, {
+        nudge = {
             "role": "user", "content": _get_continuation_prompt(st.is_stub, _dropped_tools),
             "_length_continuation_nudge": True,
-        })
+        }
+        if _invisible_stub:
+            nudge[_INVISIBLE_STUB_KEY] = _invisible_stub  # lets _repeated_stub_failure see a repeat
+        append_message(messages, nudge)
         agent._session_messages = messages
         _retry.restart_with_length_continuation = True
         return st.done("break")

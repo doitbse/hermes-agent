@@ -58,6 +58,16 @@ class _NativeTaskCardStream:
     label_prefix: str = ""
 
 
+def is_task_card_message(msg: Any) -> bool:
+    """A posted thinking card: the live ``context``-only view, the folded ``plan`` block, or the
+    one-line ``context`` fold fallback. Progress chatter, never conversation content."""
+    blocks = msg.get("blocks") if isinstance(msg, dict) else None
+    if not isinstance(blocks, list) or not blocks:
+        return False
+    types = {(b or {}).get("type") for b in blocks if isinstance(b, dict)}
+    return bool(types) and types <= {"context", "plan"}
+
+
 async def start_native_stream(
     client, stream: _NativeTaskCardStream, metadata: Optional[dict[str, Any]]
 ) -> None:

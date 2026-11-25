@@ -134,3 +134,73 @@ def test_repeated_real_length_truncation_is_unchanged():
     agent._try_activate_fallback.assert_not_called()
     assert verdict.length_continue_retries == 2
     assert verdict.truncated_response_parts == [(GLITCH, False), (GLITCH, False)]
+
+
+# Leaked special tokens (``<end_of_image>``) carry no visible text: they must never be
+# persisted as a fragment, yet two identical clean-EOF stubs are still a repeat failure.
+LEAK = "<end_of_image>"
+
+
+def _real_strip_agent(fallback_chain=()):
+    from agent.agent_runtime_helpers import strip_think_blocks
+
+    agent = _agent(fallback_chain)
+    agent._strip_think_blocks = lambda text: strip_think_blocks(agent, text)
+    return agent
+
+
+def test_leaked_token_stub_is_not_persisted_as_fragment():
+    agent = _real_strip_agent()
+    verdict = _first_attempt(agent, LEAK)
+    assert verdict.truncated_response_parts == []
+    assert len(verdict.messages) == 2
+    assert verdict.messages[1]["_length_continuation_nudge"] is True
+    assert verdict.messages[1]["role"] == "user"
+    assert all(LEAK not in (m.get("content") or "") for m in verdict.messages)
+
+
+def test_repeated_leaked_token_clean_eof_stub_switches_to_fallback():
+    agent = _real_strip_agent(fallback_chain=[{"provider": "other"}])
+    first = _first_attempt(agent, LEAK)
+    retry = TurnRetryState()
+    verdict = _recover(agent, _response(f" {LEAK}\n"), first.messages,
+                       first.truncated_response_parts, first.length_continue_retries, retry)
+
+    assert verdict.action == "break"
+    agent._try_activate_fallback.assert_called_once_with(reason=FailoverReason.incomplete_response)
+    assert retry.restart_with_rebuilt_messages is True
+    assert verdict.messages == [{"role": "user", "content": "hi"}]
+
+
+def test_repeated_leaked_token_stub_without_fallback_ends_turn():
+    agent = _real_strip_agent()
+    first = _first_attempt(agent, LEAK)
+    verdict = _recover(agent, _response(LEAK), first.messages,
+                       first.truncated_response_parts, first.length_continue_retries)
+
+    assert verdict.action == "return"
+    assert verdict.result["final_response"] == _REPEATED_STUB_FINAL
+    assert not _has_trail(verdict.result["messages"])
+
+
+def test_leaked_token_length_stop_is_not_stitched():
+    agent = _real_strip_agent()
+    first = _first_attempt(agent, LEAK, stub=False)
+    assert first.truncated_response_parts == []
+    assert all(LEAK not in (m.get("content") or "") for m in first.messages)
+    verdict = _recover(agent, _response(LEAK, stub=False), first.messages,
+                       first.truncated_response_parts, first.length_continue_retries)
+    # A real length stop is not a stub: it keeps continuing, still without garbage fragments.
+    assert verdict.action == "break"
+    assert verdict.truncated_response_parts == []
+    agent._try_activate_fallback.assert_not_called()
+
+
+def test_visible_stub_after_leaked_stub_is_not_a_repeat():
+    agent = _real_strip_agent(fallback_chain=[{"provider": "other"}])
+    first = _first_attempt(agent, LEAK)
+    verdict = _recover(agent, _response("Real answer"), first.messages,
+                       first.truncated_response_parts, first.length_continue_retries)
+    assert verdict.action == "break"
+    agent._try_activate_fallback.assert_not_called()
+    assert verdict.truncated_response_parts == [("Real answer", True)]

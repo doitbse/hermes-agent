@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from agent import empty_response_guard as _empty_guard
+from agent.agent_runtime_helpers import is_leaked_special_tokens_only
 from agent.message_metadata import append_message
 from agent.message_sanitization import _sanitize_surrogates
 from agent.turn_context_compaction import _refund_api_call
@@ -105,6 +106,7 @@ def add_empty_response_retry_hint(agent: Any, api_messages: list[dict[str, Any]]
 def _retry_empty(
     agent: Any, response: Any, finish_reason: str, empty_candidate: bool, *, messages: Any,
     conversation_history: Any, api_call_count: int, observed_generation: bool = False,
+    final_response: Any = None,
 ) -> tuple:
     """Budgeted empty-response retry. Each empty attempt re-bills the full input, so the
     signature is recorded and deterministic empties stop burning paid retries (fails
@@ -115,6 +117,7 @@ def _retry_empty(
     if empty_candidate:
         _empty_guard.record_empty_attempt(
             agent, finish_reason=finish_reason, response=response, observed_generation=observed_generation,
+            leaked_special_tokens=not observed_generation and is_leaked_special_tokens_only(final_response),
         )
     budget = (
         _empty_guard.empty_retry_budget(agent, response)
@@ -362,6 +365,7 @@ def recover_empty_response(
         agent, response, finish_reason, _empty_candidate, messages=messages,
         conversation_history=conversation_history, api_call_count=api_call_count,
         observed_generation=_has_structured,
+        final_response=getattr(assistant_message, "content", None) or final_response,
     )
     if action is not None:
         return _verdict(action, interrupt_result)
