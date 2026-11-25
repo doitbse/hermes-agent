@@ -604,9 +604,251 @@ _PYTHON_EXCEPTION_LINE_RE = re.compile(
 # (unterminated quote → shell EOF / SyntaxError). A scheme word with no token after it
 # (``"authorization: bearer "``, ``(Authorization: Basic)``) is not a credential: the optional
 # scheme group backs off and would otherwise mask the scheme word itself (#142574).
-_AUTH_SCHEME_WORD = r"(?:bearer|basic|bot|token|digest|negotiate|ntlm|oauth)(?=[`)\],.;:!?]*(?:[\s\"']|$))"
+# Outer backticks and unclosed-outside delimiters (plus glued ``](url)`` / ``</tag>``) are
+# peeled after the mask by _auth_header_parts; horizontal whitespace avoids crossing lines.
+_AUTH_BALANCED_CLOSERS = {")": "(", "]": "[", ">": "<", "}": "{"}
+_AUTH_SCHEME_WORD = (
+    r"(?:bearer|basic|bot|token|digest|negotiate|ntlm|oauth)"
+    r"(?=(?:`|[)\]>},.;:!?])*(?:[\s\"']|\\+[\"']|</|$|\[*\]\())"
+)
 _AUTH_HEADER_RE = re.compile(
-    rf"((?:Proxy-)?Authorization:\s*)([A-Za-z][\w.+-]*\s+)?(?!{_AUTH_SCHEME_WORD})([^\s\"']+)", re.IGNORECASE)
+    rf"((?:Proxy-)?Authorization:[ \t]*)([A-Za-z][\w.+-]*[ \t]+)?(?!{_AUTH_SCHEME_WORD})([^\s\"']+)",
+    re.IGNORECASE,
+)
+_AUTH_MARKER_RE = re.compile(
+    r"(?:\*{3}|«redacted(?::[^»\s]*|-[a-z-]+)»|\[(?:redacted|REDACTED)\]|\[redacted-[a-z]+(?:-[a-z]+)*\])"
+)
+
+
+class _AuthLineState:
+    """Incremental per-line scanner state: ``outer`` delimiter depths outside any code span, the
+    length of the open backtick code span (0 = none) and ``code`` depths inside that span."""
+
+    __slots__ = ("outer", "bt", "code")
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.outer = dict.fromkeys("([<{", 0)
+        self.bt = 0
+        self.code = dict.fromkeys("([<{", 0)
+
+    def advance(self, s: str) -> None:
+        """Scan ``s`` left to right (state resets after the last newline in ``s``). O(len(s))."""
+        nl = s.rfind("\n")
+        if nl >= 0:
+            self.reset()
+            s = s[nl + 1:]
+        n = len(s)
+        i = 0
+        while i < n:
+            ch = s[i]
+            if ch == "`":
+                j = i + 1
+                while j < n and s[j] == "`":
+                    j += 1
+                k = j - i
+                if self.bt == 0:
+                    self.bt = k
+                    self.code = dict.fromkeys("([<{", 0)
+                elif k == self.bt:
+                    self.bt = 0
+                i = j
+                continue
+            depth = self.outer if self.bt == 0 else self.code
+            if ch == "<":
+                if not (i + 1 < n and s[i + 1] in " =\t"):
+                    depth["<"] += 1
+            elif ch in depth:
+                depth[ch] += 1
+            elif ch in _AUTH_BALANCED_CLOSERS:
+                op = _AUTH_BALANCED_CLOSERS[ch]
+                if depth[op] > 0:
+                    depth[op] -= 1
+            i += 1
+
+
+def _split_plain_credential(sub: str, open_outer: "Mapping[str, int]", next_char: str) -> tuple[str, str]:
+    """Split ``sub`` into (credential, trailing outer delimiters), O(len(sub)).
+
+    ``(Authorization: Bearer tok)`` / ``…Bearer tok,`` keep their closer: dropping it corrupts the
+    surrounding prose or markup. A trailing closer ends the credential only when its opener is
+    unclosed OUTSIDE the header (``open_outer``) and was not opened inside ``sub``. A single trailing
+    ``.`` is sentence punctuation; ``..``/``...`` stays (masked output already contains ``...``)."""
+    cut = len(sub)
+    n = cut
+    c_open = dict.fromkeys("([<{", 0)
+    c_close = dict.fromkeys(")]>}", 0)
+    for i in range(n):
+        ch = sub[i]
+        if ch == "<" and i + 2 < n and sub[i + 1] == "/" and sub[i + 2].isalpha():
+            cut = i
+            break
+        if ch in c_open:
+            c_open[ch] += 1
+        elif ch in _AUTH_BALANCED_CLOSERS:
+            c_close[ch] += 1
+            if (ch == "]" and c_close["]"] > c_open["["]
+                    and open_outer.get("[", 0) >= (c_close["]"] - c_open["["])
+                    and i + 1 < n and sub[i + 1] == "("):
+                c_close["]"] -= 1
+                cut = i
+                break
+    if cut == n and next_char and next_char in "\"'":
+        bs = 0
+        while bs < cut and sub[cut - 1 - bs] == "\\":
+            bs += 1
+        if bs % 2 == 1:
+            cut -= bs
+    rem_outer = dict(open_outer)
+    while cut > 0:
+        ch = sub[cut - 1]
+        if ch in _AUTH_BALANCED_CLOSERS:
+            op = _AUTH_BALANCED_CLOSERS[ch]
+            if c_close[ch] > c_open[op] and rem_outer.get(op, 0) > 0:
+                c_close[ch] -= 1
+                rem_outer[op] -= 1
+                cut -= 1
+            else:
+                break
+        elif ch == ",":
+            cut -= 1
+        elif ch == "." and not (cut >= 2 and sub[cut - 2] == "."):
+            cut -= 1
+        else:
+            break
+    return sub[:cut], sub[cut:]
+
+
+def _is_valid_outer_tail(after: str, open_outer: "Mapping[str, int]", next_char: str = "") -> bool:
+    return _split_plain_credential(after, open_outer, next_char)[0] == ""
+
+
+def _find_exact_backtick_run(s: str, start: int, k: int) -> int:
+    """Index of the first run of exactly ``k`` backticks in ``s[start:]``, or -1."""
+    n = len(s)
+    i = start
+    while i < n:
+        if s[i] != "`":
+            i += 1
+            continue
+        j = i + 1
+        while j < n and s[j] == "`":
+            j += 1
+        if j - i == k:
+            return i
+        i = j
+    return -1
+
+
+def _split_ticked_credential(
+    sub: str, open_outer: "Mapping[str, int]", next_char: str
+) -> tuple[str, str, str]:
+    """Split ``sub`` into (leading backticks, credential, tail), honoring a backtick wrapper."""
+    n = len(sub)
+    if sub.startswith("`"):
+        mlen = 1
+        while mlen < n and sub[mlen] == "`":
+            mlen += 1
+        close = _find_exact_backtick_run(sub, mlen, mlen)
+        if close >= 0:
+            after = sub[close + mlen:]
+            if _is_valid_outer_tail(after, open_outer, next_char):
+                return "`" * mlen, sub[mlen:close], sub[close:]
+            # composite credential (``hdr`.`payload``, ``part1`part2``): split as a whole
+        else:
+            cred, tail = _split_plain_credential(sub[mlen:], open_outer, next_char)
+            return "`" * mlen, cred, tail
+    cred, tail = _split_plain_credential(sub, open_outer, next_char)
+    return "", cred, tail
+
+
+def _auth_header_parts(m: "re.Match[str]", mask, st: "_AuthLineState") -> tuple[str, list[str]]:
+    """Redact one header match. Returns (replacement, strings to feed the line scanner)."""
+    unchanged = (m.group(0), [m.group(0)])
+    text = m.string
+    head = m.group(1) + (m.group(2) or "")
+    token = m.group(3)
+    next_char = text[m.end():m.end() + 1]
+    if text.startswith("[REDACTED PRIVATE KEY]", m.start(3)):
+        return unchanged
+    k = st.bt
+    tail_extra = ""
+    if k > 0:
+        ticks = "`" * k
+        if token.startswith(ticks) and (len(token) == k or token[k] != "`"):
+            head += ticks
+            token = token[k:]
+            if not token:
+                return unchanged
+            lead = ""
+            bt_pos = token.find("`")
+            split_done = False
+            if bt_pos >= 0:
+                bt_end = bt_pos + 1
+                while bt_end < len(token) and token[bt_end] == "`":
+                    bt_end += 1
+                if _is_valid_outer_tail(token[bt_end:], st.outer, next_char):
+                    credential, tail = token[:bt_pos], token[bt_pos:]
+                    split_done = True
+            if not split_done:
+                credential, tail = _split_plain_credential(token, st.outer, next_char)
+        else:
+            close_pos = _find_exact_backtick_run(token, 0, k)
+            if close_pos >= 0 and _is_valid_outer_tail(token[close_pos + k:], st.outer, next_char):
+                sub, tail_extra, nc = token[:close_pos], token[close_pos:], ""
+            else:
+                if close_pos >= 0:
+                    # Composite credential across the closing backtick run: mask the whole
+                    # credential and re-emit the closing run before ``tail`` so the outer code
+                    # span still closes and ``st.advance(tail)`` sees ``tail`` outside code.
+                    lead, (credential, tail) = "", _split_plain_credential(token, st.outer, next_char)
+                    tail = ticks + tail
+                    sub = None
+                else:
+                    sub, nc = token, next_char
+            if sub is not None:
+                lead, credential, tail = _split_ticked_credential(sub, st.code, nc)
+                tail += tail_extra
+    else:
+        lead, credential, tail = _split_ticked_credential(token, st.outer, next_char)
+    if not credential or credential == "`":
+        return unchanged
+    if _AUTH_MARKER_RE.fullmatch(credential):
+        return unchanged
+    if "`" in credential:
+        masked = mask("x") if mask is _mask_token_nonreusable else "***"
+    else:
+        masked = mask(credential)
+    head += lead
+    return head + masked + tail, [head, tail]
+
+
+def _redact_auth_header(m: "re.Match[str]", mask=None) -> str:
+    """Redact a single match with the line state computed from the text before it."""
+    st = _AuthLineState()
+    st.advance(m.string[:m.start()])
+    return _auth_header_parts(m, mask or _mask_token, st)[0]
+
+
+def _redact_auth_headers(text: str, mask=None) -> str:
+    """Redact every Authorization header in ``text``; one left-to-right O(N) pass."""
+    mask = mask or _mask_token
+    st = _AuthLineState()
+    out: list[str] = []
+    cursor = 0
+    for m in _AUTH_HEADER_RE.finditer(text):
+        between = text[cursor:m.start()]
+        st.advance(between)
+        out.append(between)
+        replacement, scan = _auth_header_parts(m, mask, st)
+        out.append(replacement)
+        for piece in scan:
+            st.advance(piece)
+        cursor = m.end()
+    out.append(text[cursor:])
+    return "".join(out)
 
 # Gate for _AUTH_HEADER_RE: the header-name substring in ANY casing. A mixed-case
 # name (aUtHoRiZaTiOn) contains neither the all-lower nor the all-upper run, so
@@ -1597,7 +1839,8 @@ def redact_credential_shapes(text: str, *, force: bool = False, code_file: bool 
         text = _BASIC_PAIR_ASSIGN_RE.sub(_basic_pair, text)
 
     if _AUTH_GATE_RE.search(text):  # cheapest gate over every casing
-        text = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)), text)
+        _auth_mask = _mask_token_nonreusable if file_read else _mask_token
+        text = _redact_auth_headers(text, _auth_mask)
 
     if ":" in text:
         text = redact_header_credentials(text)
@@ -1776,7 +2019,7 @@ REDACTION_UNAVAILABLE = "[redaction-unavailable]"
 # ASCII lookbehind (not Unicode ``\b``): a Unicode word neighbor can hide ``Bearer <opaque>``
 # the same way prefix tokens used to hide behind ``\b``.
 _BEARER_RESIDUE_RE = re.compile(
-    r"(?<![A-Za-z0-9_])Bearer\s+(?:\[[^\]]+\]|[A-Za-z0-9._~+/-]{20,}=*)",
+    r"(?<![A-Za-z0-9_])Bearer\s+(?!(?-i:\[(?:redacted|REDACTED)(?: PRIVATE KEY)?\]))(?:\[[^\]]+\]|[A-Za-z0-9._~+/-]{20,}=*)",
     re.IGNORECASE,
 )
 

@@ -859,3 +859,157 @@ class TestPlanMessagesAndCodeLinks:
         from plugins.platforms.slack.block_kit import _inline_elements
         assert _inline_elements(md) == [
             {"type": "link", "url": url, "text": label, "style": {"code": True}}]
+
+
+class TestMarkdownLinkBalancedBracketLabels:
+    URL = "https://github.com/o/r/blob/main/app/posts/%5BpostId%5D/route.ts"
+
+    @staticmethod
+    def _links(md):
+        blocks = render_blocks(md)
+        out = []
+
+        def walk(node):
+            if isinstance(node, dict):
+                if node.get("type") == "link":
+                    out.append(node)
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+
+        walk(blocks)
+        return out
+
+    def test_plain_label_with_inner_brackets(self):
+        links = self._links(f"- [posts/[postId]/route.ts]({self.URL})")
+        assert [(l["url"], l.get("text")) for l in links] == [(self.URL, "posts/[postId]/route.ts")]
+
+    def test_code_label_with_inner_brackets(self):
+        links = self._links(f"- [`posts/[postId]/route.ts`]({self.URL})")
+        assert len(links) == 1 and links[0]["url"] == self.URL
+        assert links[0]["text"] == "posts/[postId]/route.ts"
+        assert links[0]["style"] == {"code": True}
+
+    def test_multiple_links_on_one_line(self):
+        u2 = "https://example.com/b"
+        links = self._links(f"- [a/[x]/p.ts]({self.URL}) and [b]({u2}) and [c/[y]]({u2}/c)")
+        assert [(l["url"], l["text"]) for l in links] == [
+            (self.URL, "a/[x]/p.ts"), (u2, "b"), (u2 + "/c", "c/[y]")]
+
+    def test_unrelated_brackets_before_link(self):
+        links = self._links("- [note] see [link](https://example.com/z) [tail]")
+        assert [(l["url"], l["text"]) for l in links] == [("https://example.com/z", "link")]
+
+
+class TestFormatMessageBalancedBracketLabels:
+    URL = "https://github.com/o/r/blob/main/app/posts/%5BpostId%5D/route.ts"
+
+    def test_label_with_inner_brackets(self):
+        out = _fmt()(f"[posts/[postId]/route.ts]({self.URL})")
+        assert out == f"<{self.URL}|posts/[postId]/route.ts>"
+
+    def test_backticked_label_with_inner_brackets(self):
+        out = _fmt()(f"[`posts/[postId]/route.ts`]({self.URL})")
+        assert self.URL in out and "posts/[postId]/route.ts" in out
+        assert "](" not in out
+
+    def test_multiple_links_one_line(self):
+        out = _fmt()(f"[a/[x]]({self.URL}) and [b](https://example.com/b)")
+        assert out == f"<{self.URL}|a/[x]> and <https://example.com/b|b>"
+
+    def test_unrelated_brackets_before_link(self):
+        out = _fmt()("[note] see [link](https://example.com/z)")
+        assert out == "[note] see <https://example.com/z|link>"
+
+    def test_code_span_wrapped_link_with_inner_brackets_is_unwrapped(self):
+        out = _fmt()(f"`[posts/[postId]/route.ts]({self.URL})`")
+        assert out == f"<{self.URL}|posts/[postId]/route.ts>"
+
+
+class TestReviewRegressionsBlockKit:
+    def test_two_level_bracket_label(self):
+        from plugins.platforms.slack.block_kit import _LINK_RE
+        m = _LINK_RE.search("[a/[b/[c]]/d.ts](https://example.com/x)")
+        assert m and m.group(1) == "a/[b/[c]]/d.ts"
+
+    def test_two_level_bracket_label_format_message(self):
+        out = _fmt()("[a/[b/[c]]/d.ts](https://example.com/x)")
+        assert out == "<https://example.com/x|a/[b/[c]]/d.ts>"
+
+    def test_code_span_link_unwrap_balanced_paren_url(self):
+        url = "https://en.wikipedia.org/wiki/Foo_(bar)"
+        out = _fmt()(f"`[label]({url})`")
+        assert out == f"<{url}|label>"
+
+    def test_link_mrkdwn_bolds_whole_link_for_bold_label(self):
+        from plugins.platforms.slack.block_kit import link_mrkdwn
+        assert link_mrkdwn("https://e.com", "**hi**") == "*<https://e.com|hi>​*"
+        assert link_mrkdwn("https://e.com", "__hi__") == "*<https://e.com|hi>​*"
+
+    def test_link_mrkdwn_keeps_dunder_in_bracket_path(self):
+        from plugins.platforms.slack.block_kit import link_mrkdwn
+        out = link_mrkdwn("https://e.com", "[__slug__]/page")
+        assert "__slug__" in out and not out.startswith("*")
+
+    def test_link_mrkdwn_escapes_label_and_url(self):
+        from plugins.platforms.slack.block_kit import link_mrkdwn
+        out = link_mrkdwn("https://e.com/a|b>c<d", "x <!here> & y")
+        assert out.startswith("<https://e.com/a%7Cb%3Ec%3Cd|")
+        assert "<!here>" not in out and "&lt;!here&gt;" in out and "&amp;" in out
+
+    @pytest.mark.parametrize("label", ["posts/[_id_]/route.ts", "app/[__slug__]/page.tsx"])
+    def test_underscore_in_brackets_not_emphasis(self, label):
+        url = "https://example.com/x"
+        links = TestMarkdownLinkBalancedBracketLabels._links(f"- [{label}]({url})")
+        assert [(l["url"], l["text"]) for l in links] == [(url, label)]
+        for l in links:
+            assert not (l.get("style") or {}).get("italic")
+            assert not (l.get("style") or {}).get("bold")
+
+    def test_underscore_emphasis_still_works(self):
+        from plugins.platforms.slack.block_kit import _BOLD_RE, _ITALIC_RE
+        assert _BOLD_RE.search("a __bold__ b")
+        assert _ITALIC_RE.search("a _it_ b")
+        assert not _ITALIC_RE.search("[_id_]")
+        assert not _BOLD_RE.search("[__slug__]")
+
+
+class TestG4CRound3Slack:
+    def test_inline_code_link_label_escapes_angle_brackets(self):
+        from plugins.platforms.slack.adapter import SlackAdapter
+
+        a = SlackAdapter.__new__(SlackAdapter)
+        assert a.format_message("[`a > b`](https://example.com/a)") == "<https://example.com/a|`a &gt; b`>"
+
+    def test_dunder_span_cannot_cross_internal_dunder(self):
+        from plugins.platforms.slack.block_kit import _BOLD_RE, _LABEL_BOLD_RE, link_mrkdwn, render_blocks
+
+        s = "__init__.py and __repr__()"
+        for rx in (_BOLD_RE, _LABEL_BOLD_RE):
+            assert not any("init__.py and" in (m.group(m.lastindex) or "") for m in rx.finditer(s))
+        assert "__init__.py" in link_mrkdwn("https://example.com/a", s)
+        flat = str(render_blocks("- " + s))
+        assert "__init__.py" in flat
+
+
+class TestG4CRound4Slack:
+    @pytest.mark.parametrize("src,want", [
+        ("[`__init__`](https://example.com/a)", "<https://example.com/a|`__init__`>"),
+        ("[`__all__`](https://example.com/a)", "<https://example.com/a|`__all__`>"),
+        ("[`x**2 + y**2`](https://example.com/a)", "<https://example.com/a|`x**2 + y**2`>"),
+        ("[`foo(**kw)` and `bar(** args)`](https://example.com/a)",
+         "<https://example.com/a|`foo(**kw)` and `bar(** args)`>"),
+    ])
+    def test_code_span_in_link_label_not_unbolded(self, src, want):
+        from plugins.platforms.slack.adapter import SlackAdapter
+
+        a = SlackAdapter.__new__(SlackAdapter)
+        assert a.format_message(src) == want
+
+    def test_label_bold_dunder_requires_nonspace_edges(self):
+        from plugins.platforms.slack.block_kit import _LABEL_BOLD_RE
+
+        assert not _LABEL_BOLD_RE.search("__ a __")
+        assert _LABEL_BOLD_RE.search("__a__")

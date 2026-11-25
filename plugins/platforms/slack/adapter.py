@@ -94,6 +94,8 @@ logger = logging.getLogger(__name__)
 from hermes_cli.version_info import hermes_user_agent
 
 _SLACK_ERROR_BODY_LIMIT_BYTES = 8 * 1024
+# Markdown link label: allows two levels of balanced brackets (``[app/[__slug__]/page.tsx](url)``).
+_LINK_LABEL = r"\[((?:[^\[\]\n]|\[(?:[^\[\]\n]|\[[^\[\]\n]*\])*\])+)\]"
 _BOOL_WORDS = frozenset({"1", "0", "true", "false", "yes", "no", "on", "off"})
 
 # Model picker Block Kit action IDs. The picker is a two-step drill-down:
@@ -3110,7 +3112,9 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             url = m.group(2).strip()
             if url.startswith("<") and url.endswith(">"):
                 url = url[1:-1].strip()
-            return _ph(link_mrkdwn(url, m.group(1)))
+            # Restore inline-code placeholders in the label so link_mrkdwn escapes <, >, &.
+            label = re.sub(r"\x00SL(\d+)\x00", lambda p: placeholders[p.group(0)], m.group(1))
+            return _ph(link_mrkdwn(url, label))
 
         def _convert_header(m):
             inner = re.sub(r"\*\*(.+?)\*\*", r"\1", m.group(1).strip())
@@ -3128,8 +3132,9 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         # "&amp;lt;" twice). ``None`` marks the escape step.
         passes = (
             (r"(```(?:[^\n]*\n)?[\s\S]*?```)", _protect_fence, 0),
-            (r"(`[^`]+`)", lambda m: m.group(1)[1:-1] if re.fullmatch(r"<https?://[^>\n]+>|\[[^\]]+\]\([^()\s]+\)", m.group(1)[1:-1]) else _ph(m.group(0)), 0),
-            (r"(?<!!)\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)", _convert_markdown_link, 0),
+            # Link labels allow two levels of balanced brackets (``[posts/[postId]/route.ts](url)``).
+            (r"(`[^`]+`)", lambda m: m.group(1)[1:-1] if re.fullmatch(r"<https?://[^>\n]+>|" + _LINK_LABEL + r"\([^()\s]+(?:\([^()]*\)[^()\s]*)*\)", m.group(1)[1:-1]) else _ph(m.group(0)), 0),
+            (r"(?<!!)" + _LINK_LABEL + r"\(([^()]*(?:\([^()]*\)[^()]*)*)\)", _convert_markdown_link, 0),
             (r"(<(?:[@#!]|(?:https?|mailto|tel):)[^>\n]+>)", lambda m: _ph(m.group(1)), 0),
             (r"^(>+\s)", lambda m: _ph(m.group(0)), re.MULTILINE),
             None,

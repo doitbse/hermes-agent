@@ -223,7 +223,7 @@ def settled_end(text: str) -> int:
             return end
 
 
-def _lookback_start(text: str, upto: int) -> int:
+def _lookback_start(text: str, upto: int, settled: int | None = None) -> int:
     """Where re-redaction restarts: the start of the line holding ``upto`` (line-anchored
     patterns such as YAML keys and connection strings need it), at most _LOOKBACK back.
     Multi-line candidates never reach back here: settled_end holds them until complete."""
@@ -231,7 +231,13 @@ def _lookback_start(text: str, upto: int) -> int:
     newline = text.rfind("\n", lo, upto)
     if newline >= 0 or lo == 0:
         return newline + 1
-    return max(text.rfind(" ", 0, lo), text.rfind("\t", 0, lo)) + 1
+    start = lo
+    while start > 0 and not text[start - 1].isspace():
+        start -= 1
+    end = settled if settled is not None else upto
+    if "uthorization" in text[start:end].lower():
+        start = text.rfind("\n", 0, start) + 1
+    return start
 
 
 def redact_to_fixpoint(text: str) -> str:
@@ -257,7 +263,7 @@ def redact_settled(text: str, redacted_prefix: str, *, done: bool) -> tuple[str,
     settled = len(text) if done else max(settled_end(text), upto)
     if upto == settled and redacted_prefix:
         return text, settled
-    start = _lookback_start(text, upto)
+    start = _lookback_start(text, upto, settled)
     if done:
         # A value longer than _LOOKBACK may sit across ``upto``: redact back to its line's start.
         start = min(start, text.rfind("\n", 0, upto) + 1)

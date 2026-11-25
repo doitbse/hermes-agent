@@ -2024,3 +2024,295 @@ class TestPasswordOnlyConnStrings:
             t0 = time.perf_counter()
             redact_sensitive_text(text, force=True)
             assert time.perf_counter() - t0 < 0.5, unit
+
+
+class TestAuthHeaderOuterDelimiters:
+    """``_AUTH_HEADER_RE``: closing prose/markup delimiters stay outside the mask."""
+
+    H = "Authorization: Bearer "
+
+    @staticmethod
+    def _fix(text):
+        from gateway.stream_consumer_redact import redact_to_fixpoint
+        return redact_to_fixpoint(text)
+
+    @pytest.mark.parametrize("text,expected", [
+        ("(`{H}draft_sk_*`)", "(`{H}***`)"),
+        ("({H}tok_123)", "({H}***)"),
+        ("[{H}tok_123].", "[{H}***]."),
+        ("<{H}tok_123>", "<{H}***>"),
+        ("see ({H}tok_123), then go", "see ({H}***), then go"),
+    ])
+    def test_outer_delimiters_preserved(self, text, expected):
+        text, expected = text.format(H=self.H), expected.format(H=self.H)
+        assert redact_sensitive_text(text, force=True) == expected
+        assert self._fix(text) == expected
+
+    def test_placeholder_keeps_code_span_balanced(self):
+        text = f"(`{self.H}<token>`)"
+        out = redact_sensitive_text(text, force=True)
+        assert out.startswith(f"(`{self.H}") and out.endswith("`)")
+        assert out.count("`") == 2 and "<token>" not in out
+        assert redact_sensitive_text(out, force=True) == out
+
+    @pytest.mark.parametrize("n", [16, 17])
+    @pytest.mark.parametrize("wrap", ["(`{}`)", "`{}`", "({})"])
+    def test_short_tokens_do_not_leak_across_18_char_floor(self, n, wrap):
+        tok = "a1B2c3D4e5F6g7H8i"[:n]
+        text = wrap.format(self.H + tok) + " and `other`"
+        out = redact_sensitive_text(text, force=True)
+        assert tok not in out and tok[:6] not in out
+        assert out.count("`") == text.count("`")
+        assert out.endswith(" and `other`")
+        assert redact_sensitive_text(out, force=True) == out
+        assert self._fix(text) == self._fix(self._fix(text))
+
+    @pytest.mark.parametrize("n", [18, 19, 32])
+    @pytest.mark.parametrize("wrap", ["(`{}`)", "({})"])
+    def test_long_tokens_converge_and_keep_delimiters(self, n, wrap):
+        tok = ("a1B2c3D4e5F6g7H8i9J0" * 2)[:n]
+        text = wrap.format(self.H + tok) + " tail `x`"
+        once = redact_sensitive_text(text, force=True)
+        assert tok not in once
+        assert once.startswith(wrap.split("{}")[0] + self.H)
+        assert once.endswith(wrap.split("{}")[1] + " tail `x`")
+        # Repeated passes must settle (partial mask collapses at most once) and never
+        # swallow the closing delimiter.
+        twice = redact_sensitive_text(once, force=True)
+        thrice = redact_sensitive_text(twice, force=True)
+        assert thrice == twice
+        assert twice.endswith(wrap.split("{}")[1] + " tail `x`")
+        fixed = self._fix(text)
+        assert tok not in fixed and self._fix(fixed) == fixed
+        assert fixed.endswith(wrap.split("{}")[1] + " tail `x`")
+
+
+class TestAuthHeaderReviewRegressions:
+    """G4C review: horizontal whitespace, backticks, outer closers, escapes, perf."""
+
+    H = "Authorization: Bearer "
+    TOK = "SyntheticOpaqueCredential92837465"
+
+    def _r(self, text):
+        return redact_sensitive_text(text, force=True)
+
+    def test_header_does_not_span_newlines(self):
+        out = self._r("Authorization:\nsecretvalueonnextline123456789")
+        assert out == "Authorization:\nsecretvalueonnextline123456789"
+        out = self._r(f"{self.H}\nsecretvalueonnextline123456789")
+        assert "secretvalueonnextline123456789" in out
+
+    def test_backtick_wrapped_credential_masked(self):
+        out = self._r(f"{self.H}`{self.TOK}` done")
+        assert self.TOK not in out
+        assert out.startswith(f"{self.H}`") and out.endswith("` done")
+
+    def test_unclosed_leading_backtick_masked(self):
+        out = self._r(f"{self.H}`{self.TOK}")
+        assert self.TOK not in out and out.startswith(f"{self.H}`")
+
+    def test_code_span_closing_backtick_and_glued_tail_preserved(self):
+        out = self._r(f"[`{self.H}{self.TOK}`](https://example.com/x) more")
+        assert self.TOK not in out
+        assert out.endswith("`](https://example.com/x) more")
+        assert out.count("`") == 2
+
+    def test_backtick_wrapped_credential_inside_parens(self):
+        out = self._r(f"(`{self.H}`{self.TOK}`)")
+        assert self.TOK not in out and out.endswith(")")
+
+    def test_outer_closer_and_glued_link_url_preserved(self):
+        out = self._r(f"[see {self.H}{self.TOK}](https://example.com/a)")
+        assert self.TOK not in out
+        assert out.endswith("](https://example.com/a)")
+
+    def test_curly_closer_preserved(self):
+        out = self._r("{" + f"{self.H}{self.TOK}" + "}")
+        assert self.TOK not in out and out.endswith("}")
+
+    def test_closing_html_tag_not_swallowed(self):
+        out = self._r(f"<code>{self.H}{self.TOK}</code>")
+        assert self.TOK not in out and out.endswith("</code>")
+
+    def test_inner_balanced_brackets_stay_in_credential(self):
+        out = self._r(f"({self.H}abc(def){self.TOK})")
+        assert self.TOK not in out and out.endswith(")")
+
+    def test_escaped_quote_backslash_preserved(self):
+        out = self._r('"' + self.H.replace("Bearer ", "") + "Bearer " + self.TOK + '\\"')
+        assert self.TOK not in out and out.endswith('\\"')
+
+    def test_password_punctuation_not_peeled(self):
+        for pw in ("MySecretPass123!", "MySecretPass123?", "MySecretPass123;"):
+            out = self._r(f"{self.H}{pw}")
+            assert pw[:-1] not in out
+            assert not out.endswith(pw[-1]) or "..." in out or "***" in out
+
+    def test_trailing_comma_and_single_period_peeled_not_ellipsis(self):
+        assert self._r(f"{self.H}{self.TOK}.").endswith(".")
+        assert self._r(f"{self.H}{self.TOK},").endswith(",")
+        assert self.TOK not in self._r(f"{self.H}{self.TOK}...")
+
+    def test_split_helper_directly(self):
+        from agent.redact import _AuthLineState, _is_valid_outer_tail, _split_plain_credential
+        o = {"(": 1}
+        assert _split_plain_credential("tok)", o, "") == ("tok", ")")
+        assert _split_plain_credential("tok)", {}, "") == ("tok)", "")
+        assert _split_plain_credential("a(b)c)", o, "") == ("a(b)c", ")")
+        assert _split_plain_credential("tok</code>", {}, "") == ("tok", "</code>")
+        assert _split_plain_credential("tok\\", {}, '"') == ("tok", "\\")
+        assert _split_plain_credential("tok\\\\", {}, '"') == ("tok\\\\", "")
+        assert _split_plain_credential("tok\\", {}, "") == ("tok\\", "")
+        assert _split_plain_credential("tok...", {}, "") == ("tok...", "")
+        assert _split_plain_credential("tok.,", {}, "") == ("tok", ".,")
+        assert _is_valid_outer_tail(")", o) and not _is_valid_outer_tail("x)", o)
+
+        def st(s):
+            x = _AuthLineState()
+            x.advance(s)
+            return x
+        assert st("a ( b [ c ]").outer["("] == 1 and st("a ( b [ c ]").outer["["] == 0
+        assert st("x < y (").outer["<"] == 0
+        assert st("<a ").outer["<"] == 1
+        s = st("(`x(` ")
+        assert s.outer["("] == 1 and s.bt == 0
+        s = st("(`x(")
+        assert s.bt == 1 and s.code["("] == 1 and s.outer["("] == 1
+
+    def test_round2_code_span_and_composite_cases(self):
+        H = "Authorization:"
+        for t in (f"({H} Bearer)", f"{{{H} Bearer}}", f"(`{H} Bearer`)", f"``{H} Bearer``",
+                  f"[{H} Bearer](https://example.com/docs)", f"<code>{H} Bearer</code>",
+                  f'\\"{H} Bearer\\"'):
+            assert self._r(t) == t
+        assert self._r(f"(e.g. `{H} Basic P@ssw0rd)9`)") == f"(e.g. `{H} Basic ***`)"
+        assert self._r(f"(`{H} Bearer secret`)") == f"(`{H} Bearer ***`)"
+        assert self._r(f"(`{H} Bearer `secret_tok_123`)") == f"(`{H} Bearer `***`)"
+        for t in (f"{H} Basic `admin`:MySecretPass123", f"{H} Bearer `hdr`.`payload`.`sig`",
+                  f"{H} Bearer `part1`part2_secret"):
+            assert self._r(t) == t.split(" ")[0] + " " + t.split(" ")[1] + " ***"
+        t = f"{H} Bearer [REDACTED PRIVATE KEY]"
+        assert self._r(t) == t
+
+    def test_auth_scan_linear(self):
+        import time
+        from agent.redact import _redact_auth_headers
+        text = f"x (Authorization: Bearer abcdefghijklmnop123456) " * 4000
+        t0 = time.perf_counter()
+        _redact_auth_headers(text)
+        assert time.perf_counter() - t0 < 0.1
+
+    def test_markers_not_clobbered(self):
+        for marker in ("«redacted:ghp_…»", "***"):
+            text = f"{self.H}{marker}"
+            assert self._r(text) == text
+        text = f"({self.H}`***`)"
+        assert self._r(text) == text
+
+    def test_file_read_uses_nonreusable_mask(self):
+        from agent.redact import redact_credential_shapes
+        out = redact_credential_shapes(f"{self.H}{self.TOK}", force=True, file_read=True)
+        assert self.TOK not in out
+        assert self.TOK[:6] not in out and self.TOK[-4:] not in out
+
+    def test_linear_time_on_pathological_input(self):
+        import time
+        text = self.H + "(" * 20000 + "x" * 20000
+        t0 = time.perf_counter()
+        self._r(text)
+        self._r(self.H + "[" * 20000 + ")" * 20000)
+        assert time.perf_counter() - t0 < 2.0
+
+
+class TestG4CRound3:
+    @staticmethod
+    def _r(text):
+        return redact_sensitive_text(text, force=True)
+
+    @pytest.mark.parametrize("text", [
+        "`Authorization: Basic admin`:MySecretPass123",
+        "`Authorization: Bearer user:`MySecretPass123",
+        "`Authorization: Bearer bot.`MySecretPass123",
+        "`Authorization: Bearer hdr.`payload_secret.sig_secret",
+        "(`Authorization: Bearer prefix_`MySecretPass123)",
+    ])
+    def test_composite_credential_with_backtick_fully_masked(self, text):
+        out = self._r(text)
+        for leak in ("MySecretPass123", "payload_secret", "sig_secret", "admin`"):
+            assert leak not in out
+        assert "***" in out
+
+    def test_multi_backtick_wrapped_credential_keeps_closer(self):
+        assert self._r("(``Authorization: Bearer ``secret_tok_123``)") == "(``Authorization: Bearer ``***``)"
+
+    @pytest.mark.parametrize("text", [
+        "Authorization: Basic [redactedPass123456789]",
+        "Authorization: Basic [REDACTED_API_KEY_SECRET]",
+    ])
+    def test_lookalike_markers_are_redacted(self, text):
+        out = self._r(text)
+        assert out != text
+        assert "Pass123456789" not in out and "API_KEY_SECRET" not in out
+
+    @pytest.mark.parametrize("marker", [
+        "«redacted-vault-secret»", "«redacted:ghp_…»", "[redacted]", "[REDACTED]", "[redacted-jwt]",
+    ])
+    def test_real_markers_preserved(self, marker):
+        text = f"Authorization: Bearer {marker}"
+        assert self._r(text) == text
+
+    def test_next_char_propagates_through_outer_tail(self):
+        from agent.redact import _is_valid_outer_tail
+
+        assert _is_valid_outer_tail("", {"(": 0}, "\"") is True
+        assert self._r('"Authorization: Bearer `secret_tok_123`"') == '"Authorization: Bearer `***`"'
+        assert self._r("(`Authorization: Bearer `secret_tok_123`)") == "(`Authorization: Bearer `***`)"
+
+
+class TestG4CRound4:
+    @staticmethod
+    def _r(text):
+        return redact_sensitive_text(text, force=True)
+
+    @pytest.mark.parametrize("text", [
+        "`Authorization: Bearer bot`:MySecretPass123",
+        "`Authorization: Basic token`:MySecretPass123",
+        "`Authorization: Bearer oauth`:MySecretPass123",
+        "`Authorization: Bearer`:MySecretPass123",
+        "`Authorization: token`:MySecretPass123",
+        "`Authorization: bot`.MySecretPass123",
+    ])
+    def test_r4_p0_1_scheme_word_before_backtick_credential(self, text):
+        assert "MySecretPass123" not in self._r(text)
+
+    @pytest.mark.parametrize("text", [
+        "(Authorization: Bearer )", "(Authorization: Bearer)", "Authorization: Bearer token",
+    ])
+    def test_r4_p0_1_bare_scheme_word_preserved(self, text):
+        assert self._r(text) == text
+
+    @pytest.mark.parametrize("text,secret", [
+        ("Authorization: Basic [redacted:MySuperSecretPassword123!]", "MySuperSecretPassword123"),
+        ("Authorization: Token [redacted:secret_api_key_999]", "secret_api_key_999"),
+        ("Authorization: Basic [redacted-my_secret_token_987654321]", "my_secret_token_987654321"),
+    ])
+    def test_r4_p0_2_fake_markers_with_secrets_redacted(self, text, secret):
+        assert secret not in self._r(text)
+
+    @pytest.mark.parametrize("marker", [
+        "[redacted]", "[REDACTED]", "[redacted-jwt]", "«redacted-vault-secret»", "«redacted:ghp_…»",
+    ])
+    def test_r4_p0_2_real_markers_preserved(self, marker):
+        text = f"Authorization: Basic {marker}"
+        assert self._r(text) == text
+
+    def test_r4_p1_4_composite_credential_closing_outer_span(self):
+        from gateway.stream_consumer_redact import redact_to_fixpoint
+
+        c = "(`Authorization: Bearer prefix_`MySecretPass123)"
+        assert self._r(c) == "(`Authorization: Bearer ***`)"
+        assert redact_to_fixpoint(c) == "(`Authorization: Bearer ***`)"
+        line = "`Authorization: Basic admin`:MySecretPass123 and `Authorization: Bearer secret_tok_123`"
+        want = "`Authorization: Basic ***` and `Authorization: Bearer ***`"
+        assert self._r(line) == want
+        assert redact_to_fixpoint(line) == want

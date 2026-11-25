@@ -93,7 +93,10 @@ def _indent_level(spaces: str) -> int:
 
 # Order matters: code first (opaque), then links, then emphasis.
 _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
-_LINK_RE = re.compile(r"(?<!!)\[([^\]]+)\]\(([^()\s]+(?:\([^()]*\)[^()\s]*)*)\)")
+# A label may hold one level of balanced brackets: ``[posts/[postId]/route.ts](url)``
+# (Next.js / SvelteKit dynamic-route paths) is a link, not literal text.
+_LINK_LABEL = r"\[((?:[^\[\]\n]|\[(?:[^\[\]\n]|\[[^\[\]\n]*\])*\])+)\]"
+_LINK_RE = re.compile(r"(?<!!)" + _LINK_LABEL + r"\(([^()\s]+(?:\([^()]*\)[^()\s]*)*)\)")
 # Slack mrkdwn autolink: <scheme:target> or <scheme:target|label>.
 _SLACK_LINK_RE = re.compile(
     r"<([a-zA-Z][a-zA-Z0-9+.\-]*:[^>|]+)(?:\|([^>]+))?>"
@@ -108,11 +111,15 @@ _SLACK_MENTION_RE = re.compile(
 )
 # Emphasis regexes are alternations; the span is always ``m.group(m.lastindex)``.
 # A closer never directly precedes another delimiter char, so ``***x***`` is bold(italic(x)).
-_BOLD_RE = re.compile(r"\*\*(.+?)\*\*(?!\*)|__(.+?)__(?!_)")
-# `_` never opens/closes intraword (CommonMark), so snake_case stays literal.
+_BOLD_RE = re.compile(
+    r"\*\*(.+?)\*\*(?!\*)"
+    r"|(?<![\w\*_\[/])__(?=\S)((?:(?!__).)+?)(?<=\S)__(?![\w\*_\]/(]|\.\w)"
+)
+# `_` never opens/closes intraword (CommonMark), so snake_case stays literal; `[`/`]` also
+# bound it so ``[posts/[_id_]/route.ts](url)`` doesn't split on ``_id_``.
 _ITALIC_RE = re.compile(
     r"(?<![\*_])\*(?![\*_\s])(.+?)(?<![\*_\s])\*(?![\*_])"
-    r"|(?<![\w\*_])_(?![\*_\s])(.+?)(?<![\*_\s])_(?![\w\*_])"
+    r"|(?<![\w\*_\[/])_(?![\*_\s])(.+?)(?<![\*_\s])_(?![\w\*_\]/]|\.\w)"
 )
 _STRIKE_RE = re.compile(r"~~(.+?)~~")
 _EMPHASIS = ((_BOLD_RE, "bold"), (_STRIKE_RE, "strike"), (_ITALIC_RE, "italic"))
@@ -702,6 +709,10 @@ def _escape_mrkdwn(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _escape_link_url(url: str) -> str:
+    return url.replace("|", "%7C").replace(">", "%3E").replace("<", "%3C")
+
+
 def _inline_mrkdwn(el: dict[str, Any]) -> str:
     etype = el.get("type")
     if etype == "user":
@@ -715,7 +726,8 @@ def _inline_mrkdwn(el: dict[str, Any]) -> str:
     text = _escape_mrkdwn(el.get("text") or "")
     if etype == "link":
         url = el.get("url") or ""
-        text = f"<{url}|{text}>" if text and text != url else f"<{url}>"
+        safe_url = _escape_link_url(url)
+        text = f"<{safe_url}|{text}>" if text and text != url else f"<{safe_url}>"
     core = text.strip()
     if not core:
         return text
@@ -1068,12 +1080,27 @@ def heading_marks(node: dict) -> str:
     return "#" * min(max(level, 1), 6)
 
 
+_LABEL_BOLD_RE = re.compile(
+    r"\*\*(.+?)\*\*(?!\*)|(?<![\w\[/])__(?=\S)((?:(?!__).)+?)(?<=\S)__(?![\w_\]/(]|\.\w)"
+)
+
+
 def link_mrkdwn(url: str, label: str) -> str:
     """mrkdwn link; it has no emphasis inside a label, so bold the whole link instead
     (U+200B before the closing ``*`` as in ``_convert_bold``, since it follows ``>``)."""
-    clean = re.sub(r"\*\*(.+?)\*\*|__(.+?)__", lambda b: b.group(1) or b.group(2), label)
-    link = f"<{url}|{clean}>"
-    return f"*{link}\u200b*" if clean != label else link
+    code_spans: list[str] = []
+    shielded = _INLINE_CODE_RE.sub(
+        lambda m: (code_spans.append(m.group(0)), f"\x00LC{len(code_spans) - 1}\x00")[1],
+        label,
+    )
+    clean_shielded = _LABEL_BOLD_RE.sub(lambda b: b.group(1) or b.group(2), shielded)
+    clean = re.sub(r"\x00LC(\d+)\x00", lambda m: code_spans[int(m.group(1))], clean_shielded)
+    # The label may already be mrkdwn-escaped (``format_message`` output): unescape first so
+    # ``&lt;!here>`` is not double-escaped to ``&amp;lt;``.
+    unescaped = clean.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    escaped_label = _escape_mrkdwn(unescaped)
+    link = f"<{_escape_link_url(url)}|{escaped_label}>"
+    return f"*{link}\u200b*" if clean_shielded != shielded else link
 
 
 def plan_messages(chunks: list[str], batches: Optional[list[list[Block]]]) -> list[tuple[str, Optional[list[Block]]]]:

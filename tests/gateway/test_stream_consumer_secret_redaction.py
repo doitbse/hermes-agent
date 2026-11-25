@@ -167,3 +167,75 @@ async def test_failed_reply_file_resumes_without_cutting_into_a_masked_secret():
     await asyncio.wait_for(task, 30)
     assert not any(password[2:-2] in text for text in shown)
     assert "Done." in shown[-1]
+
+
+def test_lookback_start_reaches_line_start_for_authorization_in_new_text():
+    from gateway.stream_consumer_redact import _lookback_start
+
+    text = "x" + " ".join(["word"] * 400) + " Authorization: Bearer tok"
+    upto = len(text) - 20  # ``Authorization`` sits in the newly settled text, past ``upto``
+    assert _lookback_start(text, upto) > 0
+    assert _lookback_start(text, upto, len(text)) == 0
+
+
+@pytest.mark.parametrize("chunk", [1, 7, 20])
+def test_streamed_authorization_inside_code_span_never_leaks(chunk):
+    from gateway.stream_consumer_redact import redact_settled
+
+    full = "(`" + ("word " * 300) + "Authorization: Bearer secret_tok_123`) tail and `code` end."
+    prefix = ""
+    acc = ""
+    step = chunk
+    for i in range(0, len(full), step):
+        acc += full[i:i + step]
+        acc, settled = redact_settled(acc, prefix, done=False)
+        assert "secret_tok_123" not in acc[:settled]
+        prefix = acc[:settled]
+    final, _ = redact_settled(full, prefix, done=True)
+    assert "secret_tok_123" not in final
+    assert "Authorization: Bearer ***`) tail and `code` end." in final
+
+
+@pytest.mark.asyncio
+async def test_single_line_authorization_code_span_reconciles_in_consumer():
+    full = "(`" + ("word " * 300) + "Authorization: Bearer secret_tok_123`) tail and `code` end."
+    adapter = _adapter()
+    consumer = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(cursor=""))
+    consumer.on_delta(full)
+    consumer.finish(full)
+    await consumer.run()
+    assert consumer.delivered_final_matches(full) is True
+    assert all("secret_tok_123" not in t for t in _delivered(adapter))
+
+
+_R4_MULTILINE = [
+    ("Prefix (`see Authorization: Bearer secret_tok_123`) on line one.\n"
+     + ("wwww " * (985 // 5)) + "end.", "secret_tok_123"),
+    ("In prose we discuss api_key: someOpaqueTokenValue12345 here.\n"
+     + ("wwww " * (985 // 5)) + "tail.", "someOpaqueTokenValue12345"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("full,secret", _R4_MULTILINE, ids=["authorization-line", "api-key-line"])
+async def test_multiline_r4_streams_without_leak_and_reconciles(full, secret):
+    from gateway.stream_consumer_redact import redact_settled, redact_to_fixpoint
+
+    for step in (1, 7, 20):
+        prefix = acc = ""
+        for i in range(0, len(full), step):
+            acc += full[i:i + step]
+            acc, settled = redact_settled(acc, prefix, done=False)
+            if secret == "secret_tok_123":  # prose ``api_key:`` is not redacted by design
+                assert secret not in acc[:settled]
+            prefix = acc[:settled]
+        final, _ = redact_settled(acc, prefix, done=True)
+        assert final == redact_to_fixpoint(full)
+    adapter = _adapter()
+    consumer = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(cursor=""))
+    consumer.on_delta(full)
+    consumer.finish(full)
+    await consumer.run()
+    assert consumer.delivered_final_matches(full) is True
+    if secret == "secret_tok_123":
+        assert all(secret not in t for t in _delivered(adapter))
