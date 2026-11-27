@@ -3808,7 +3808,27 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             self._session_tasks.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)
             return False
+        event._session_task = task
         return True
+
+    def has_active_session(self, chat_id: str, thread_id: Optional[str] = None) -> bool:
+        """True if an unfinished session task exists for chat_id (and thread_id when given)."""
+        tasks = getattr(self, "_session_tasks", None)
+        if not isinstance(tasks, dict):
+            return False
+        cid = str(chat_id or "")
+        tid = str(thread_id or "")
+        if not cid:
+            return False
+        for sk, task in list(tasks.items()):
+            if isinstance(task, asyncio.Task) and not task.done():
+                ssk = str(sk)
+                if tid:
+                    if cid in ssk and tid in ssk:
+                        return True
+                elif ssk.endswith(f":{cid}") or cid in ssk:
+                    return True
+        return False
 
     def _track_session_task(self, session_key: str, task: Any) -> bool:
         """Record ``task`` as the session owner and track it for shutdown; False when

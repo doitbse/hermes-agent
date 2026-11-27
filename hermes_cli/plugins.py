@@ -147,6 +147,12 @@ VALID_HOOKS: set[str] = {
     # fast-path of /new; see gateway/run.py::_interrupt_and_clear_session). Kwargs: session_key,
     # platform, reason, invalidation_reason. Return values are ignored.
     "agent_loop_stopped",
+    # platform_connected: an adapter finished connect(). Kwargs: platform, adapter, is_reconnect. Returns ignored.
+    # platform_inbound_event: raw inbound platform event BEFORE dedup/prefilter (adapters with
+    # supports_inbound_event_hook). Kwargs: platform, kind, event, payload, removed, adapter, dispatch.
+    # Return {"action": "drop"|"skip"|"defer"} to stop normal handling (first wins); a deferring plugin
+    # later awaits dispatch(event, clear_ts=...) to run it. None/"allow" -> normal.
+    "platform_connected", "platform_inbound_event",
     # Approval observers (returns ignored; veto via pre_tool_call). Kwargs: command, description, pattern_key,
     # pattern_keys, session_key, surface ("cli"|"gateway"|"smart"|"mcp-elicitation/<server>"|"mcp-trust/<server>"|
     # "vault-payment"); post_approval_response adds choice/decided_by. on_human_input_*: tools/human_input_hooks.py.

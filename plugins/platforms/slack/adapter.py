@@ -12,7 +12,7 @@ import re
 import time
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, ClassVar, Collection, Dict, Optional, Any, Tuple, List
+from typing import Awaitable, Callable, ClassVar, Collection, Dict, Iterable, Optional, Any, Tuple, List
 
 aiohttp: Any = None
 try:
@@ -991,6 +991,15 @@ def _is_transient_transport_error(e: BaseException) -> bool:
         and not is_permanent_tls_error)
 
 
+async def _ainvoke_platform_hook(hook_name: str, **kwargs: Any) -> list[Any]:
+    """``ainvoke_hook`` without loading plugins on the event loop: a hook nothing can consume is
+    skipped on the loop, an undecided one is resolved by ``has_hook`` (which may discover) in a thread."""
+    from hermes_cli.lifecycle import ainvoke_hook, has_hook, hook_known_unused
+    if hook_known_unused(hook_name) or not await asyncio.to_thread(has_hook, hook_name):
+        return []
+    return await ainvoke_hook(hook_name, **kwargs)
+
+
 class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformAdapter):
     """Slack bot adapter (Socket Mode).
     Needs SLACK_BOT_TOKEN (xoxb-, API calls) and SLACK_APP_TOKEN (xapp-, Socket Mode). DMs +
@@ -1006,6 +1015,8 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
     # ``reply_in_thread: false`` gives both a flat outbound reply and a whole-channel
     # session bucket, so a flat continuable cron continues on a plain reply.
     supports_inchannel_continuable = True
+    # Raw message/reaction/slash events fire ``platform_inbound_event`` before dedup/prefilter.
+    supports_inbound_event_hook: bool = True
 
     # Bounded-cache caps (instance assignment in tests overrides per adapter).
     _USER_NAME_CACHE_MAX = _CHANNEL_NAME_CACHE_MAX = _DM_CONVERSATION_CACHE_MAX = 5000
@@ -1811,6 +1822,11 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
                 raise
             logger.info("[Slack] Socket Mode connected (%d workspace(s))", len(self._team_clients))
             self._hint_allow_bots()
+            try:
+                await _ainvoke_platform_hook(
+                    "platform_connected", platform="slack", adapter=self, is_reconnect=is_reconnect)
+            except Exception:
+                logger.warning("[Slack] platform_connected hook invocation failed", exc_info=True)
             return True
         except Exception as e:  # pragma: no cover - defensive logging
             proxy_error = describe_proxy_error(e, proxy_url)
@@ -3846,6 +3862,10 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         (Feishu/Photon convention) from the reactor in the reacted-to thread, so the normal auth
         gate applies. Hooks fire for every non-self reaction; agent routing is opt-in via
         ``reaction_triggers`` and, without an explicit allowlist, only on the bot's own messages."""
+        if isinstance(event, dict):
+            action = await self._invoke_platform_inbound_event(kind="reaction", event=event, removed=removed)
+            if action in ("drop", "skip", "defer"):
+                return
         item = event.get("item") or {}
         if item.get("type") != "message":
             return
@@ -4657,8 +4677,81 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             self._register_mentioned_thread(thread_ts, team_id=team_id)
         return text, original_text, command_probe_text, is_command_text
 
-    async def _handle_slack_message_impl(self, event: dict, payload: Optional[dict] = None) -> None:
-        """Handle an incoming Slack message event."""
+    def clear_processed_dedup(self, ts_values: Iterable[str], *, team_id: str = "",
+                              channel_id: str = "") -> None:
+        """Forget dedup claims for ``ts_values`` so a plugin-deferred event can be re-driven."""
+        claims = getattr(self, "_processed_message_ts", None)
+        seen = getattr(getattr(self, "_dedup", None), "_seen", None)
+        for raw in ts_values:
+            ts = str(raw or "")
+            if not ts:
+                continue
+            for key in ((team_id, channel_id, ts), (channel_id, ts), ts):
+                if isinstance(claims, dict):
+                    claims.pop(key, None)
+                elif isinstance(claims, set):
+                    claims.discard(key)
+                elif isinstance(claims, list):
+                    while key in claims:
+                        claims.remove(key)
+            for key in (self._workspace_event_id(team_id, ts), ts):
+                if isinstance(seen, dict):
+                    seen.pop(key, None)
+                elif isinstance(seen, set):
+                    seen.discard(key)
+
+    def has_active_thread_turn(self, channel_id: str, thread_ts: str = "") -> bool:
+        """True while a turn task runs for ``channel_id`` (scoped to ``thread_ts`` when given)."""
+        return BasePlatformAdapter.has_active_session(self, channel_id, thread_ts or None)
+
+    async def _invoke_platform_inbound_event(
+        self, *, kind: str, event: dict, payload: Optional[dict] = None, removed: bool = False,
+        dispatch: Any = None) -> Optional[str]:
+        """Fire ``platform_inbound_event``; return the first plugin ``action`` string, if any."""
+        try:
+            results = await _ainvoke_platform_hook(
+                "platform_inbound_event",
+                platform="slack",
+                kind=kind,
+                event=event,
+                payload=payload,
+                removed=removed,
+                adapter=self,
+                dispatch=dispatch,
+            )
+        except Exception:
+            logger.warning("[Slack] platform_inbound_event hook invocation failed", exc_info=True)
+            return None
+        for result in results or ():
+            if isinstance(result, dict) and isinstance(result.get("action"), str):
+                return result["action"]
+        return None
+
+    async def dispatch_inbound_message(
+        self, event: dict, payload: Optional[dict] = None, *,
+        clear_ts: Optional[Iterable[str]] = None) -> Optional[asyncio.Task]:
+        """Run a (possibly plugin-coalesced) message through normal handling, skipping the
+        inbound hook; buffered timestamps are released from dedup first. Returns the turn task."""
+        ts_values = [*(clear_ts or ()), *(event.get("_hermes_coalesced_ts") or ()),
+                     event.get("ts"), event.get("thread_ts")]
+        team_id = self._event_team_id(event, payload, install_set=getattr(self, "_team_clients", None))
+        self.clear_processed_dedup(ts_values, team_id=team_id or "",
+                                   channel_id=str(event.get("channel") or ""))
+        return await self._process_slack_message_impl(event, payload)
+
+    async def _handle_slack_message_impl(self, event: dict, payload: Optional[dict] = None) -> Optional[asyncio.Task]:
+        """Handle an incoming Slack message event: ``platform_inbound_event`` may drop/defer it."""
+        if isinstance(event, dict) and not event.get("_hermes_inbound_hook_ready"):
+            action = await self._invoke_platform_inbound_event(
+                kind="message", event=event, payload=payload,
+                dispatch=lambda ev, payload=payload, clear_ts=None: self.dispatch_inbound_message(
+                    ev, payload, clear_ts=clear_ts))
+            if action in ("drop", "skip", "defer"):
+                return None
+        return await self._process_slack_message_impl(event, payload)
+
+    async def _process_slack_message_impl(self, event: dict, payload: Optional[dict] = None) -> Optional[asyncio.Task]:
+        """Handle an incoming Slack message event; returns the spawned turn task when known."""
         accepted = await self._prefilter_inbound(event, payload)
         if accepted is None:
             return
@@ -4788,7 +4881,16 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
                 f"{msg_event.text}")
         if ts:
             self._remember_processed_message_ts(ts)
+        _before_tasks = dict(getattr(self, "_session_tasks", None) or {})
         await self.handle_message(msg_event)
+        spawned = getattr(msg_event, "_session_task", None)
+        if isinstance(spawned, asyncio.Task):
+            return spawned
+        for sk, task in list((getattr(self, "_session_tasks", None) or {}).items()):
+            if (isinstance(task, asyncio.Task) and not task.done() and _before_tasks.get(sk) is not task
+                    and channel_id in str(sk) and (thread_ts or "") in str(sk)):
+                return task
+        return None
 
     async def _build_message_event(
         self, event: dict, *, text: str, original_text: str, command_probe_text: str,
@@ -6190,6 +6292,10 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
     async def _handle_slash_command(self, command: dict) -> None:
         """Slash commands: native ``/<command> [args]`` for every COMMAND_REGISTRY entry, or
         ``/hermes <subcommand> [args]``; other text after ``/hermes`` is a regular message."""
+        if isinstance(command, dict):
+            action = await self._invoke_platform_inbound_event(kind="slash_command", event=command)
+            if action in ("drop", "skip", "defer"):
+                return
         user_id = command.get("user_id", "")
         channel_id = command.get("channel_id", "")
         team_id = command.get("team_id", "")
