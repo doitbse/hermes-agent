@@ -1805,6 +1805,28 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             }
         return merged
 
+    def _run_agent_is_allowed_silence(self, response: Any, turn_ctx: TurnContext) -> bool:
+        """Predict ``_hmwa_shape_agent_response``'s silence verdict before progress cleanup runs.
+        Must mirror that predicate: a false positive deletes the card above a visible reply."""
+        from gateway.run import _is_gateway_hidden_reasoning_incomplete_turn
+        if not isinstance(response, dict):
+            return False
+        try:
+            text = "" if _is_gateway_hidden_reasoning_incomplete_turn(response) else (
+                response.get("final_response") or "")
+            if not self._is_intentional_silence(response, text):
+                return False
+            source = response.get("queued_terminal_source", turn_ctx.source)
+            reply_expected = response.get("queued_terminal_reply_expected", turn_ctx.reply_expected)
+            if not automatic_notices_allowed(source):
+                reply_expected = False
+            return bool(self._silence_allowed_for_source(
+                source, response.get("queued_terminal_display_kind", turn_ctx.persist_user_display_kind),
+                reply_expected, response))
+        except Exception:
+            logger.debug("silent-turn prediction failed; keeping the folded task card", exc_info=True)
+            return False
+
     async def _run_agent_cleanup_turn_tasks(
         self, turn_ctx: TurnContext, *, progress_task: Any, log_task: Any, interrupt_monitor: asyncio.Task,
         _notify_task: asyncio.Task, tracking_task: asyncio.Task, stream_task: Any,
@@ -2135,6 +2157,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             adapter = self._delivery_adapter_for(source)
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
+            turn_ctx._silent_turn_exit = self._run_agent_is_allowed_silence(response, turn_ctx)
             if pending_event or pending:
                 await settle_turn_senders(progress_task, _notify_task)  # their bubble ids join this turn's cleanup
                 return await self._run_agent_queued_followup(

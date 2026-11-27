@@ -45,6 +45,9 @@ class TurnContext:
     _cleanup_msg_ids: list[str] = field(default_factory=list)
     _progress_metadata: Optional[dict] = None
     _progress_reply_to: Optional[Any] = None
+    # Set before progress cleanup when the turn ends in allowed silence: the task card is
+    # deleted rather than folded, so no orphan "Thought for Ns" card is left in the thread.
+    _silent_turn_exit: bool = False
     message: Optional[str] = None  # the only rebindable field
     # turn parameters / config snapshots (read-only in run_sync)
     history: Any = None

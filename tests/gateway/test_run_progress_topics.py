@@ -2176,3 +2176,37 @@ class TestSlackReplyInThreadProgressRouting:
             event_message_id="evt-trigger-001",
             reply_in_thread=True,
         ) == "evt-trigger-001"
+
+
+class DeleteAwareNativeTaskCardAdapter(NativeTaskCardAdapter):
+    def __init__(self, platform=Platform.SLACK):
+        super().__init__(platform=platform)
+        self.stop_deletes = []
+
+    async def stop_native_task_card_progress(self, chat_id, *, reply_to=None, metadata=None, delete=False):
+        self.native_stops += 1
+        self.stop_deletes.append(delete)
+
+
+class SilentNativeToolsAgent(DuplicateNativeToolsAgent):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        super().run_conversation(message, conversation_history, task_id, **kwargs)
+        return {"final_response": "NO_REPLY", "messages": [], "api_calls": 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allowed", [True, False])
+async def test_slack_native_card_deleted_only_when_turn_ends_in_allowed_silence(monkeypatch, tmp_path, allowed):
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner, "_silence_allowed_for_source",
+        lambda self, source, display_kind, reply_expected, agent_result: allowed,
+    )
+    adapter, result = await _run_with_agent(
+        monkeypatch, tmp_path, SilentNativeToolsAgent, session_id=f"sess-silent-{allowed}",
+        platform=Platform.SLACK, chat_id="C1", thread_id="thread-1",
+        adapter_cls=DeleteAwareNativeTaskCardAdapter, user_id="U1", scope_id="T1",
+    )
+
+    assert adapter.native_updates
+    assert adapter.stop_deletes == [allowed]

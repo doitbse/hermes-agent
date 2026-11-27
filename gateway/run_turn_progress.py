@@ -633,10 +633,17 @@ class GatewayTurnProgressMixin:
             if hasattr(adapter, "stop_native_task_card_progress"):
                 # Best-effort on the turn-cleanup path: an escaping transport exception would skip
                 # final-delivery logic (cleanup awaits catch only CancelledError).
+                stop_kwargs = {"reply_to": ctx._progress_reply_to, "metadata": ctx._progress_metadata}
+                if getattr(ctx, "_silent_turn_exit", False):
+                    stop_kwargs["delete"] = True  # only passed when set: older adapters lack the kwarg
                 try:
-                    await adapter.stop_native_task_card_progress(
-                        ctx.source.chat_id, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
-                    )
+                    try:
+                        await adapter.stop_native_task_card_progress(ctx.source.chat_id, **stop_kwargs)
+                    except TypeError:
+                        if "delete" not in stop_kwargs:
+                            raise
+                        stop_kwargs.pop("delete")
+                        await adapter.stop_native_task_card_progress(ctx.source.chat_id, **stop_kwargs)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
