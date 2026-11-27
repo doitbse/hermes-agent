@@ -8,6 +8,7 @@ from plugins.platforms.slack.block_kit import (
     MAX_SECTION_TEXT,
     _header_block,
     _render_markdown,
+    _render_table,
     blocks_fallback_text,
     estimate_text_chars,
     plan_messages,
@@ -859,3 +860,55 @@ class TestPlanMessagesAndCodeLinks:
         from plugins.platforms.slack.block_kit import _inline_elements
         assert _inline_elements(md) == [
             {"type": "link", "url": url, "text": label, "style": {"code": True}}]
+
+
+class TestHtmlLineBreaks:
+    @pytest.mark.parametrize("tag", ["<br>", "<br/>", "<br />", "<BR>"])
+    def test_table_cell_br_becomes_newline(self, tag):
+        assert _table_cell(f"line 1{tag}line 2") == [
+            {"type": "text", "text": "line 1"},
+            {"type": "text", "text": "\n"},
+            {"type": "text", "text": "line 2"},
+        ]
+
+    def test_br_after_bare_url_in_table_cell(self):
+        assert _table_cell("https://example.com/path<br>2) next") == [
+            {"type": "link", "url": "https://example.com/path"},
+            {"type": "text", "text": "\n"},
+            {"type": "text", "text": "2) next"},
+        ]
+
+    def test_br_after_bare_url_in_list_item(self):
+        assert _list_item("- https://example.com/path<br>2) next") == [
+            {"type": "link", "url": "https://example.com/path"},
+            {"type": "text", "text": "\n"},
+            {"type": "text", "text": "2) next"},
+        ]
+
+    def test_emphasis_spans_br(self):
+        bold = {"bold": True}
+        assert _table_cell("**bold line 1<br>bold line 2**") == [
+            {"type": "text", "text": "bold line 1", "style": bold},
+            {"type": "text", "text": "\n", "style": bold},
+            {"type": "text", "text": "bold line 2", "style": bold},
+        ]
+
+    def test_inline_code_br_stays_literal(self):
+        assert _table_cell("a `<br>` b") == [
+            {"type": "text", "text": "a "},
+            {"type": "text", "text": "<br>", "style": {"code": True}},
+            {"type": "text", "text": " b"},
+        ]
+
+    def test_fenced_code_br_stays_literal(self):
+        blocks = render_blocks("```\nx<br>y\n```")
+        assert blocks[0]["elements"][0]["type"] == "rich_text_preformatted"
+        assert blocks[0]["elements"][0]["elements"] == [{"type": "text", "text": "x<br>y"}]
+
+    def test_monospace_table_fallback_uses_slash(self):
+        assert _render_table(["| a | b |", "| x<br>y | `<br>` |", "| p<BR />q | r |"]) == (
+            "a     | b\n"
+            "------+-------\n"
+            "x / y | `<br>`\n"
+            "p / q | r"
+        )

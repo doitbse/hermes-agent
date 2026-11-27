@@ -124,6 +124,8 @@ _PLACEHOLDER_RE = re.compile(r"\x00(\d+)\x00")
 _BARE_URL_RE = re.compile(r"https?://[^\s<>]+")
 # Sentence punctuation (and a closing emphasis delimiter) after a URL is not part of it.
 _URL_TRAILING_PUNCT = ".,;:!?*~"
+# HTML line breaks the agent puts in table cells; rich_text needs a real "\n".
+_BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
 
 
 def _mention_element(body: str) -> Optional[dict[str, Any]]:
@@ -184,6 +186,9 @@ def _shield_tokens(text: str) -> Tuple[str, list[_Token]]:
     s = _SLACK_LINK_RE.sub(lambda m: link(m.group(1), m.group(2) or m.group(1), m.group(0)), s)
     s = _BARE_URL_RE.sub(bare_url, s)
     s = _SLACK_MENTION_RE.sub(lambda m: put(("mention", m.group(0), m.group(1))), s)
+    # After code (`<br>` stays literal) and bare URLs (which stop at `<`). A placeholder,
+    # not a raw "\n", so emphasis can still span the break.
+    s = _BR_RE.sub(lambda m: put(("text", "\n")), s)
     return s, tokens
 
 
@@ -485,9 +490,20 @@ def _table_block(rows: list[str], sep_line: str) -> Optional[Block]:
     return block
 
 
+def _br_outside_code(text: str, repl: str) -> str:
+    """Replace ``<br>`` tags with ``repl`` everywhere except inside inline code spans."""
+    out, pos = [], 0
+    for m in _INLINE_CODE_RE.finditer(text):
+        out += [_BR_RE.sub(repl, text[pos:m.start()]), m.group(0)]
+        pos = m.end()
+    out.append(_BR_RE.sub(repl, text[pos:]))
+    return "".join(out)
+
+
 def _render_table(rows: list[str]) -> str:
     """Render markdown pipe-table rows as aligned monospace text (fallback)."""
-    parsed = [_split_row(r) for r in rows]
+    # A newline would break row alignment, so a cell's <br> becomes " / ".
+    parsed = [[_br_outside_code(c, " / ") for c in _split_row(r)] for r in rows]
     if not parsed:
         return "\n".join(rows)
     ncols = max(len(r) for r in parsed)

@@ -352,3 +352,51 @@ class TestInboundHeaders:
             [{"type": "header", "level": 2, "text": {"type": "plain_text", "text": "Plan"}}])
         assert '"level": 2' in dumped
         assert json.loads(dumped[dumped.index("\n[") + 1:dumped.rindex("]") + 1])[0]["level"] == 2
+
+
+class TestFormatMessageHtmlLineBreaks:
+    @pytest.mark.parametrize("tag", ["<br>", "<br/>", "<br />", "<BR>"])
+    def test_br_becomes_newline_not_escaped(self, tag):
+        adapter, _ = _make_adapter()
+        out = adapter.format_message(f"line 1{tag}line 2")
+        assert out == "line 1\nline 2"
+        assert "&lt;br" not in out
+
+    def test_other_angle_brackets_still_escaped(self):
+        adapter, _ = _make_adapter()
+        assert adapter.format_message("x < y<br>z") == "x &lt; y\nz"
+
+    def test_br_after_bare_url(self):
+        adapter, _ = _make_adapter()
+        assert adapter.format_message("see https://example.com/path<br>2) next") == (
+            "see https://example.com/path\n2) next")
+
+    def test_paragraph_section_block_gets_newline(self):
+        from plugins.platforms.slack.block_kit import render_blocks
+
+        adapter, _ = _make_adapter()
+        blocks = render_blocks("see https://example.com/path<br>2) next", mrkdwn_fn=adapter.format_message)
+        assert blocks == [{"type": "section", "text": {
+            "type": "mrkdwn", "text": "see https://example.com/path\n2) next"}}]
+
+    def test_emphasis_spanning_br_wraps_each_line(self):
+        adapter, _ = _make_adapter()
+        assert adapter.format_message("**bold line 1<br>bold line 2**") == (
+            "*bold line 1*\n*bold line 2*")
+        assert adapter.format_message("~~a<br>b~~") == "~a~\n~b~"
+
+    def test_inline_and_fenced_code_br_stays_literal(self):
+        adapter, _ = _make_adapter()
+        assert adapter.format_message("a `<br>` b") == "a `<br>` b"
+        assert adapter.format_message("```\nx<br>y\n```") == "```\nx<br>y\n```"
+
+    def test_wrap_markdown_tables_uses_slash(self):
+        from plugins.platforms.slack.adapter import _wrap_markdown_tables
+
+        assert _wrap_markdown_tables("| a | b |\n|---|---|\n| x<br/>y | `<br>` |") == (
+            "```\n"
+            "| a     | b      |\n"
+            "| ----- | ------ |\n"
+            "| x / y | `<br>` |\n"
+            "```"
+        )
