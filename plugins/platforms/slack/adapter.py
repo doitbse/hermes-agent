@@ -2123,7 +2123,7 @@ class SlackAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=str(exc), retryable=True)
 
     async def _stop_native_task_card_stream(
-        self, key: tuple[str, str, str], stream: _NativeTaskCardStream) -> None:
+        self, key: tuple[str, str, str], stream: _NativeTaskCardStream, *, delete: bool = False) -> None:
         async with stream.lock:
             if stream.stopped:
                 return
@@ -2131,7 +2131,9 @@ class SlackAdapter(BasePlatformAdapter):
             try:
                 if self._app and stream.stream_ts:
                     client = self._get_client(stream.channel, team_id=stream.team_id)
-                    if self.thinking_task_cards_enabled():
+                    if delete:
+                        await client.chat_delete(channel=stream.channel, ts=stream.stream_ts)
+                    elif self.thinking_task_cards_enabled():
                         await task_cards.fold(client, stream)
                     else:
                         await client.api_call(
@@ -2144,14 +2146,15 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def stop_native_task_card_progress(
         self, chat_id: str, *, reply_to: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None, stream_suffix: str = "") -> None:
-        """Finalize an active Slack-native progress stream exactly once."""
+        metadata: Optional[dict[str, Any]] = None, stream_suffix: str = "", delete: bool = False) -> None:
+        """Finalize an active Slack-native progress stream exactly once; ``delete`` removes the
+        card instead of folding it (silent turns leave nothing behind)."""
         key = self._native_task_card_key(chat_id, reply_to, metadata, stream_suffix)
         if key is None:
             return
         stream = self._native_task_card_streams.get(key)
         if stream is not None:
-            await self._stop_native_task_card_stream(key, stream)
+            await self._stop_native_task_card_stream(key, stream, delete=delete)
 
     def _suppressed_ignored(self, chat_id: str, what: str, *, level: int = logging.WARNING) -> bool:
         """True (after logging) when ``chat_id`` is a configured ignored channel."""

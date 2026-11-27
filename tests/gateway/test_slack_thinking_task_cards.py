@@ -419,3 +419,174 @@ def test_child_relay_flushes_reasoning_tail_on_text_and_thinking(monkeypatch):
     relay._on_thinking(None, "Plain summary line", None, {})
     assert events == [("subagent.thinking", "Plain summary line")]
 
+
+
+# ── silent turn exit: delete the card instead of folding it ─────────────────────────────
+
+
+def _add_chat_delete(client):
+    client.chat_delete = AsyncMock(return_value={"ok": True})
+    return client
+
+
+@pytest.mark.asyncio
+async def test_stop_with_delete_removes_posted_card_instead_of_folding(monkeypatch):
+    adapter, client = make_adapter(monkeypatch)
+    _add_chat_delete(client)
+    tasks = [{"id": "thought_1", "kind": "thought", "title": "Thinking", "status": "in_progress"}]
+    await adapter.send_native_task_card_progress("C1", tasks, metadata=META)
+    posted_ts = client.chat_postMessage.await_args and "200.1"
+    client.chat_update.reset_mock()
+
+    await adapter.stop_native_task_card_progress("C1", metadata=META, delete=True)
+
+    client.chat_delete.assert_awaited_once_with(channel="C1", ts=posted_ts)
+    client.chat_update.assert_not_awaited()
+    assert not adapter._native_task_card_streams
+    # Exactly-once: a later (default) stop must not resurrect a fold on the deleted card.
+    await adapter.stop_native_task_card_progress("C1", metadata=META)
+    client.chat_update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stop_default_still_folds_and_never_deletes(monkeypatch):
+    adapter, client = make_adapter(monkeypatch)
+    _add_chat_delete(client)
+    tasks = [{"id": "thought_1", "kind": "thought", "title": "Thinking", "status": "complete"}]
+    await adapter.send_native_task_card_progress("C1", tasks, metadata=META)
+
+    await adapter.stop_native_task_card_progress("C1", metadata=META)
+
+    (plan,) = client.chat_update.await_args.kwargs["blocks"]
+    assert plan["type"] == "plan"
+    client.chat_delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stop_with_delete_on_native_stream_skips_stop_stream(monkeypatch):
+    adapter, client = make_adapter(monkeypatch, {"native_task_cards": True})
+    _add_chat_delete(client)
+    await adapter.send_native_task_card_progress(
+        "C1", [{"id": "t1", "title": "web_search", "status": "in_progress"}], title="Working", metadata=META)
+    stream_ts = next(iter(adapter._native_task_card_streams.values())).stream_ts
+    assert stream_ts
+    client.api_call.reset_mock()
+
+    await adapter.stop_native_task_card_progress("C1", metadata=META, delete=True)
+
+    client.chat_delete.assert_awaited_once_with(channel="C1", ts=stream_ts)
+    assert not any(c.args and c.args[0] == "chat.stopStream" for c in client.api_call.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_stop_with_delete_before_anything_posted_is_a_noop(monkeypatch):
+    from plugins.platforms.slack.adapter import _NativeTaskCardStream
+
+    adapter, client = make_adapter(monkeypatch)
+    _add_chat_delete(client)
+    key = adapter._native_task_card_key("C1", None, META, "")
+    stream = _NativeTaskCardStream.__new__(_NativeTaskCardStream)
+    import asyncio
+    stream.lock, stream.stopped, stream.stream_ts = asyncio.Lock(), False, ""
+    stream.channel, stream.team_id = "C1", "T1"
+    adapter._native_task_card_streams[key] = stream
+
+    await adapter.stop_native_task_card_progress("C1", metadata=META, delete=True)
+
+    client.chat_delete.assert_not_awaited()
+    client.chat_update.assert_not_awaited()
+    client.chat_postMessage.assert_not_awaited()
+    assert not adapter._native_task_card_streams
+
+
+def _progress_runner(silent: bool):
+    from gateway.run_turn_progress import GatewayTurnProgressMixin
+    from gateway.turn_context import TurnContext
+    import queue
+
+    ctx = TurnContext(
+        source=SimpleNamespace(chat_id="C1"), progress_queue=queue.Queue(),
+        _run_still_current=lambda: False, _progress_metadata=dict(META),
+    )
+    ctx._silent_turn_exit = silent
+
+    class _Runner(GatewayTurnProgressMixin):
+        _background_card_follow = False
+
+        def __init__(self):
+            self._ctx = ctx
+
+        def _agent_interrupted(self):
+            return False
+
+    return _Runner()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("silent", [True, False])
+async def test_progress_cleanup_deletes_card_only_on_silent_turn_exit(monkeypatch, silent):
+    adapter, client = make_adapter(monkeypatch)
+    _add_chat_delete(client)
+    await adapter.send_native_task_card_progress(
+        "C1", [{"id": "thought_1", "kind": "thought", "title": "Thinking", "status": "complete"}], metadata=META)
+    stop = AsyncMock(wraps=adapter.stop_native_task_card_progress)
+    monkeypatch.setattr(adapter, "stop_native_task_card_progress", stop)
+
+    await _progress_runner(silent)._send_native_task_card_progress(adapter)
+
+    stop.assert_awaited_once()
+    assert stop.await_args.kwargs.get("delete", False) is silent
+    if silent:
+        client.chat_delete.assert_awaited_once_with(channel="C1", ts="200.1")
+    else:
+        client.chat_delete.assert_not_awaited()
+        assert client.chat_update.await_args.kwargs["blocks"][0]["type"] == "plan"
+
+
+@pytest.mark.asyncio
+async def test_progress_cleanup_falls_back_when_adapter_lacks_delete_kwarg():
+    calls = []
+
+    class _LegacyAdapter:
+        async def stop_native_task_card_progress(self, chat_id, *, reply_to=None, metadata=None):
+            calls.append((chat_id, reply_to, metadata))
+
+    await _progress_runner(True)._send_native_task_card_progress(_LegacyAdapter())
+
+    assert calls == [("C1", None, META)]
+
+
+def _silence_predictor(allow_silence=None):
+    from gateway.response_filters import silence_allowed
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.run_turn_persistence import GatewayTurnPersistenceMixin
+
+    class _Runner(GatewayTurnPersistenceMixin):
+        _run_agent_is_allowed_silence = GatewayTurnMixin._run_agent_is_allowed_silence
+
+        def _silence_allowed_for_source(self, source, display_kind, reply_expected, agent_result):
+            return silence_allowed(display_kind, reply_expected, allow_silence=allow_silence, agent_result=agent_result)
+
+    return _Runner()
+
+
+def _turn_ctx(reply_expected, *, is_bot=False):
+    from gateway.turn_context import TurnContext
+    return TurnContext(source=SimpleNamespace(chat_id="C1", is_bot=is_bot), reply_expected=reply_expected)
+
+
+@pytest.mark.parametrize("response,reply_expected,allow,is_bot,expected", [
+    ({"final_response": "NO_REPLY"}, False, None, False, True),
+    ({"final_response": "[SILENT]"}, None, True, False, True),
+    ({"final_response": "[SILENT]"}, True, True, False, True),  # room opt-in decides
+    ({"final_response": "[SILENT]"}, True, None, True, True),  # bot peers expect no reply
+    ({"final_response": "NO_REPLY"}, True, None, False, False),  # rejected: visible fallback follows
+    ({"final_response": "[SILENT]"}, None, False, False, False),
+    ({"final_response": "Here is the answer."}, False, None, False, False),
+    ({"final_response": "NO_REPLY", "failed": True}, False, None, False, False),
+    ({"final_response": "[SILENT]", "queued_terminal_reply_expected": True}, False, None, False, False),
+    (None, False, None, False, False),
+])
+def test_silent_turn_exit_prediction_matches_delivery_verdict(response, reply_expected, allow, is_bot, expected):
+    runner = _silence_predictor(allow)
+    assert runner._run_agent_is_allowed_silence(response, _turn_ctx(reply_expected, is_bot=is_bot)) is expected
