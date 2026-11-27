@@ -224,6 +224,15 @@ def _align_table(rows: list[str]) -> list[str]:
     return out
 
 
+_BR_TAG_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+
+
+def _br_outside_code(text: str, repl: str) -> str:
+    """Replace ``<br>`` tags with ``repl`` everywhere except inside inline code spans."""
+    parts = re.split(r"(`[^`]+`)", text)
+    return "".join(p if i % 2 else _BR_TAG_RE.sub(repl, p) for i, p in enumerate(parts))
+
+
 def _wrap_markdown_tables(text: str) -> str:
     """Wrap GFM pipe tables in ``` fences and align columns; tables already in fences are left alone."""
     if not text or "|" not in text or "-" not in text:
@@ -245,7 +254,8 @@ def _wrap_markdown_tables(text: str) -> str:
                 block.append(lines[j])
                 j += 1
             out.append("```")
-            out.extend(_align_table(block))
+            # A newline would break the fenced row, so a cell's <br> becomes " / ".
+            out.extend(_align_table([_br_outside_code(r, " / ") for r in block]))
             out.append("```")
             i = j
             continue
@@ -3135,6 +3145,12 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             label = re.sub(r"\x00SL(\d+)\x00", lambda p: placeholders[p.group(0)], m.group(1))
             return _ph(link_mrkdwn(url, label))
 
+        br = "\x00BR\x00"  # <br> sentinel: survives escaping, becomes "\n" last
+
+        def _wrap(inner: str, left: str, right: str) -> str:
+            # mrkdwn emphasis can't span lines, so wrap each <br>-separated line separately.
+            return br.join(f"{left}{part}{right}" if part else "" for part in inner.split(br))
+
         def _convert_header(m):
             inner = re.sub(r"\*\*(.+?)\*\*", r"\1", m.group(1).strip())
             return _ph(f"*{inner}*")
@@ -3142,9 +3158,10 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         def _convert_bold(m):
             # Slack misses a closing * after a non-word char and silently truncates the
             # message; insert U+200B before it.
-            inner = m.group(1)
-            zw = "\u200b" if inner and not (inner[-1].isalnum() or inner[-1] == "_") else ""
-            return _ph(f"*{inner}{zw}*")
+            def bold(part: str) -> str:
+                zw = "\u200b" if not (part[-1].isalnum() or part[-1] == "_") else ""
+                return f"*{part}{zw}*"
+            return _ph(br.join(bold(p) if p else "" for p in m.group(1).split(br)))
 
         # Ordered passes: protect code/links/entities/quotes, escape, then convert emphasis.
         # Escaping unescapes first in ONE regex pass (sequential replaces would decode
@@ -3156,13 +3173,15 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             (r"(?<!!)" + _LINK_LABEL + r"\(([^()]*(?:\([^()]*\)[^()]*)*)\)", _convert_markdown_link, 0),
             (r"(<(?:[@#!]|(?:https?|mailto|tel):)[^>\n]+>)", lambda m: _ph(m.group(1)), 0),
             (r"^(>+\s)", lambda m: _ph(m.group(0)), re.MULTILINE),
+            # Code is already shielded, so only prose <br> becomes a newline (not &lt;br&gt;).
+            (r"<br\s*/?>", lambda m: br, re.IGNORECASE),
             None,
             (r"^#{1,6}\s+(.+)$", _convert_header, re.MULTILINE),
-            (r"\*\*\*(.+?)\*\*\*", lambda m: _ph(f"*_{m.group(1)}_*"), 0),
+            (r"\*\*\*(.+?)\*\*\*", lambda m: _ph(_wrap(m.group(1), "*_", "_*")), 0),
             (r"\*\*(.+?)\*\*", _convert_bold, 0),
             # *text* → _text_ only when non-whitespace touches both delimiters ("a * b * c" stays).
-            (r"(?<!\*)\*(\S(?:[^*\n]*?\S)?)\*(?!\*)", lambda m: _ph(f"_{m.group(1)}_"), 0),
-            (r"~~(.+?)~~", lambda m: _ph(f"~{m.group(1)}~"), 0))
+            (r"(?<!\*)\*(\S(?:[^*\n]*?\S)?)\*(?!\*)", lambda m: _ph(_wrap(m.group(1), "_", "_")), 0),
+            (r"~~(.+?)~~", lambda m: _ph(_wrap(m.group(1), "~", "~")), 0))
         for step in passes:
             if step is None:
                 text = _SLACK_HTML_ENTITY_RE.sub(lambda m: _SLACK_HTML_ENTITIES[m.group(1)], text)
@@ -3172,7 +3191,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
                 text = re.sub(pattern, fn, text, flags=flags)
         for key in reversed(placeholders):
             text = text.replace(key, placeholders[key])
-        return text
+        return text.replace(br, "\n")
 
     # ----- Reactions -----
 
